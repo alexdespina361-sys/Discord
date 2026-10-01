@@ -11,6 +11,9 @@ Write “come play LoL” or “come to Lidl with me” on a website, and it bec
 - **Templates** (gaming, groceries, food, gym, movie, coffee, drinks, walk) with a 🎲 re-roll for the wording, plus a **live preview** of what they'll see in Discord.
 - Summon several people at once (each gets a DM with a live roster), or post one public summons in a channel that pings everyone.
 - Optionally adds the summons to the server's **Events** tab too.
+- **`/summon` in your own DM with a friend.** Type `/summon who:@friend what:Gaming` and the summons appears right in that chat. If they don't answer, up to 3 notices follow automatically in the first 15 minutes, and a 🔔 button (issuer only) starts another round.
+- **Replies are forwarded.** Whatever your friend types to the bot is passed on to whoever summoned them. Reply to a forwarded message and your answer goes back.
+- **Blocks are respected.** If someone blocks the bot (or closes their DMs), notices to them stop and you get one message saying so.
 
 It runs for free on Cloudflare Workers. There's no server to keep running.
 
@@ -52,12 +55,17 @@ Open `https://summons-bureau.<your-subdomain>.workers.dev/setup`. It checks ever
 - **“Log in with Discord” redirect** → copy the URL it shows, then on Discord's OAuth2 page press *Add Redirect*, paste it and **Save**.
 - **Server Members Intent** → press *Enable it for me*. This lets you pick friends from a list.
 - **Bot added to your server** → press *Add bot to a server* and choose the server you share with your friend. This is the Discord approval step.
-- **/bureau command** → press *Register it* (optional).
+- **/summon allowed in personal DMs** → press *Enable it for me*.
+- **/summon and /bureau commands** → press *Register them* if it isn't already ticked.
+- **Add the Bureau to your own Discord account** → open the link and press *Authorize*. Everyone who wants to use `/summon` in their DMs does this once; people being summoned don't need it.
+- **DM forwarding is live** → nothing to do; it turns on by itself.
 - **Log in**, then press *Send me a test DM*.
 
 ### 4. Summon someone
 
-Press **Issue a summons** and pick a template. Choose your friend, or **yourself first** to see exactly what they'll get. Then press **Dispatch summons**.
+On the website: press **Issue a summons** and pick a template. Choose your friend, or **yourself first** to see exactly what they'll get. Then press **Dispatch summons**.
+
+In Discord: open your DM with a friend and type `/summon`. Pick *who*, *what* (gaming, groceries, food…), and optionally *when*, your own *title* and a *note*.
 
 ---
 
@@ -67,6 +75,8 @@ Press **Issue a summons** and pick a template. Choose your friend, or **yourself
 - **Nobody can actually be forced to respond.** The Bureau just makes ignoring it socially expensive.
 - Each summons gets a dossier page on the website with the roster, every excuse, and a full case file. Recipients can answer there too.
 - A summons closes when its event ends, and the buttons are disabled.
+- **DM forwarding needs an always-on connection to Discord.** Keeping it open uses roughly 80% of Cloudflare's free daily allowance for always-on objects (Durable Objects). That's fine for one bot. If you ever hit the limit, turn forwarding off on the setup page, or move to Cloudflare's paid Workers plan.
+- `/summon` can only post in a personal DM while Discord's 15-minute window for that command is open. Later notices and reminders come from the bot's own DM.
 
 ### Optional settings
 
@@ -86,28 +96,32 @@ To stop strangers from adding your bot to their servers: in the Developer Portal
 
 ```
 Website (Cloudflare Worker) ──REST──▶ Discord API ──DM──▶ your friend
-      ▲                                                     │ clicks a button / fills a form
+      ▲                                                     │ clicks a button / fills a form / uses /summon
       └──────────── POST /interactions (signed) ◀───────────┘
       │
-Durable Object (SQLite): summonses, responses, case log,
+Bureau Durable Object (SQLite): summonses, responses, case log, forwarding routes,
 and an alarm-driven scheduler for notices, reminders, closing files and re-syncing messages.
+
+Gateway Durable Object: one live WebSocket to Discord that hears DMs sent to the bot
+and hands them to the Bureau to forward. A 1-minute watchdog and a 5-minute cron keep it up.
 ```
 
-- `src/index.ts`: routes for the website, login, JSON API and `/interactions`.
-- `src/interactions.ts`: button clicks, forms (Discord modals), extension verdicts, `/bureau`.
-- `src/bureau.ts`: the Durable Object, holding storage and the scheduler.
+- `src/index.ts`: routes for the website, login, JSON API, `/interactions`, and the cron watchdog.
+- `src/interactions.ts`: button clicks, forms (Discord modals), extension verdicts, `/summon`, `/bureau`.
+- `src/bureau.ts`: the Bureau Durable Object, holding storage, the scheduler and the DM forwarding rules.
+- `src/gateway.ts`: the Gateway Durable Object (connect, heartbeat, resume, catch-up after reconnects).
 - `src/messages.ts`: every Discord message and form the bot sends.
 - `src/setup.ts`: the self-checking setup page.
 - `public/static/`: CSS, the official seal, and the browser scripts (live Discord preview).
 
-No gateway connection is used. Discord delivers clicks as signed HTTP requests, so it runs fine on free serverless hosting.
+Buttons, forms and commands arrive as signed HTTP requests. Only DM forwarding uses the Gateway connection.
 
 ## Development
 
 ```sh
 npm install
 npm test            # unit tests: validation, signatures, Discord payload limits
-npm run test:e2e    # whole flow in the real Workers runtime against a fake Discord API
+npm run test:e2e    # whole flow in the real Workers runtime against a fake Discord API (REST + Gateway)
 npm run typecheck
 node scripts/screenshots.mjs   # phone and desktop screenshots of every page (needs Playwright)
 ```

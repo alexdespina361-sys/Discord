@@ -13,12 +13,13 @@ import {
   SESSION_COOKIE,
   type Session,
 } from "./session";
-import { redirectUrl, runAction, runChecks, type SetupAction } from "./setup";
-import { bureauStub } from "./stub";
+import { SETUP_ACTIONS, redirectUrl, runAction, runChecks, type SetupAction } from "./setup";
+import { bureauStub, gatewayStub } from "./stub";
 import { createSummons, directory, jsonError, organizerAction, preview, respondOnWeb, searchMembers, sharedGuilds } from "./web/api";
 import { composePage, dashboardPage, dossierPage, landingPage, messagePage, prefillFrom, setupPage } from "./web/pages";
 
 export { Bureau } from "./bureau";
+export { Gateway } from "./gateway";
 
 interface Ctx {
   env: Env;
@@ -116,13 +117,13 @@ async function callback(request: Request, c: Ctx): Promise<Response> {
   return redirect(pending.next, [session, clearCookie(OAUTH_COOKIE, secure)]);
 }
 
-async function route(request: Request, env: Env): Promise<Response> {
+async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
   const origin = url.origin;
 
-  if (path === "/interactions" && method === "POST") return handleInteraction(request, env);
+  if (path === "/interactions" && method === "POST") return handleInteraction(request, env, ctx);
   if (path === "/healthz") return new Response("ok");
 
   const session = await getSession(request, env);
@@ -135,8 +136,10 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (path === "/auth/logout" && isPost) return redirect("/", [clearCookie(SESSION_COOKIE, url.protocol === "https:")]);
 
   if (path === "/setup" && method === "GET") return setupPage(c, await runChecks(env, origin, session));
-  const setupAction = path.match(/^\/setup\/(interactions|intent|commands|test-dm)$/);
-  if (setupAction && isPost) return Response.json(await runAction(setupAction[1] as SetupAction, env, origin, session));
+  const setupAction = path.match(/^\/setup\/([a-z-]+)$/);
+  if (setupAction && isPost && SETUP_ACTIONS.includes(setupAction[1] as SetupAction)) {
+    return Response.json(await runAction(setupAction[1] as SetupAction, env, origin, session));
+  }
 
   if (path === "/dev/tick" && isPost && isDevMode(env)) {
     await bureauStub(env).tick(Date.now() + Number(url.searchParams.get("advanceMs") ?? 0));
@@ -194,9 +197,9 @@ async function route(request: Request, env: Env): Promise<Response> {
 }
 
 export default {
-  async fetch(request, env): Promise<Response> {
+  async fetch(request, env, ctx): Promise<Response> {
     try {
-      return await route(request, env);
+      return await route(request, env, ctx);
     } catch (e) {
       console.error("request failed", e);
       const message = e instanceof Error ? e.message : String(e);
@@ -210,5 +213,16 @@ export default {
         { href: "/setup", label: "Check setup" },
       );
     }
+  },
+
+  /** Every 5 minutes: make sure the Gateway connection that hears DMs is up (it also has its own watchdog). */
+  async scheduled(_controller, env, ctx): Promise<void> {
+    if (missingConfig(env).length) return;
+    ctx.waitUntil(
+      gatewayStub(env)
+        .ensure()
+        .then(() => undefined)
+        .catch((e) => console.error("gateway watchdog failed", e)),
+    );
   },
 } satisfies ExportedHandler<Env>;

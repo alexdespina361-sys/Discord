@@ -9,9 +9,17 @@
     "binding": "ASSETS"
   },
   "durable_objects": {
-    "bindings": [{ "name": "BUREAU", "class_name": "Bureau" }]
+    "bindings": [
+      { "name": "BUREAU", "class_name": "Bureau" },
+      { "name": "GATEWAY", "class_name": "Gateway" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Bureau"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Bureau"] },
+    { "tag": "v2", "new_sqlite_classes": ["Gateway"] }
+  ],
+  // Safety net: revive the Gateway connection if it ever drops (e.g. after a deploy).
+  "triggers": { "crons": ["*/5 * * * *"] },
   "observability": { "enabled": true },
   // Discord credentials are set as secrets in the Cloudflare dashboard;
   // never let a deploy wipe variables that were added there.

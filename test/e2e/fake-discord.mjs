@@ -2,6 +2,7 @@
 // It enforces Discord's payload limits so we catch messages the real API would reject.
 import http from "node:http";
 import crypto from "node:crypto";
+import { WebSocketServer } from "ws";
 
 export const IDS = {
   app: "1400000000000000001",
@@ -13,6 +14,7 @@ export const IDS = {
   alice: "1400000000000000011",
   bob: "1400000000000000012", // has DMs closed
   stranger: "1400000000000000013", // not in the guild
+  personalDm: "1400000000000000099", // the organizer's own DM with Andrei (the bot isn't in it)
 };
 
 const USERS = {
@@ -97,9 +99,17 @@ export { validateMessage };
 
 // --- server ------------------------------------------------------------------------------
 
+const DISCORD_EPOCH = 1420070400000n;
+
 export function createFakeDiscord({ publicKeyHex, privateKey }) {
-  let seq = 1500000000000000000n;
-  const nextId = () => String(++seq);
+  // Real snowflakes: milliseconds since Discord's epoch, shifted left 22 bits.
+  let last = 0n;
+  const nextId = () => {
+    let id = (BigInt(Date.now()) - DISCORD_EPOCH) << 22n;
+    if (id <= last) id = last + 1n;
+    last = id;
+    return String(id);
+  };
   const dmChannels = new Map(); // userId -> channelId
   const state = {
     app: {
@@ -111,6 +121,7 @@ export function createFakeDiscord({ publicKeyHex, privateKey }) {
       interactions_endpoint_url: null,
       owner: USERS[IDS.organizer],
       bot: USERS[IDS.bot],
+      integration_types_config: { 0: {} }, // new apps only support server installs
     },
     members: [IDS.organizer, IDS.alice, IDS.bob, IDS.bot],
     dmClosed: new Set([IDS.bob]),
@@ -123,7 +134,92 @@ export function createFakeDiscord({ publicKeyHex, privateKey }) {
     authorized: new Set(), // users who approved the app before (prompt=none only works for them)
     clientSecret: "test-client-secret",
     botToken: "test-bot-token",
+    webhooks: new Map(), // interaction token -> { channelId, originalId, followups }
+    gateway: { heartbeatInterval: 2000, connections: 0, identifies: 0, resumes: 0, intents: null, session: null, sockets: new Set() },
+    port: 0,
   };
+
+  function dmChannelFor(userId) {
+    if (!dmChannels.has(userId)) dmChannels.set(userId, nextId());
+    return dmChannels.get(userId);
+  }
+
+  function dmUserOf(channelId) {
+    return [...dmChannels.entries()].find(([, cid]) => cid === channelId)?.[0] ?? null;
+  }
+
+  // --- Gateway ---------------------------------------------------------------------------
+  function gatewayDispatch(t, d) {
+    const session = state.gateway.session;
+    if (!session) return;
+    const frame = { op: 0, t, d, s: ++session.seq };
+    session.buffer.push(frame);
+    for (const conn of state.gateway.sockets) if (conn.ready) conn.ws.send(JSON.stringify(frame));
+  }
+
+  function onGatewaySocket(ws) {
+    state.gateway.connections++;
+    const conn = { ws, ready: false };
+    state.gateway.sockets.add(conn);
+    ws.send(JSON.stringify({ op: 10, d: { heartbeat_interval: state.gateway.heartbeatInterval } }));
+    ws.on("message", (raw) => {
+      const p = JSON.parse(String(raw));
+      if (p.op === 1) {
+        ws.send(JSON.stringify({ op: 11 }));
+      } else if (p.op === 2) {
+        if (p.d.token !== state.botToken) return ws.close(4004, "Authentication failed.");
+        state.gateway.identifies++;
+        state.gateway.intents = p.d.intents;
+        state.gateway.session = { id: `sess-${nextId()}`, seq: 0, buffer: [] };
+        conn.ready = true;
+        gatewayDispatch("READY", {
+          v: 10,
+          user: USERS[IDS.bot],
+          session_id: state.gateway.session.id,
+          resume_gateway_url: `ws://127.0.0.1:${state.port}`,
+          guilds: [],
+          application: { id: IDS.app },
+        });
+      } else if (p.op === 6) {
+        state.gateway.resumes++;
+        const session = state.gateway.session;
+        if (!session || p.d.session_id !== session.id) return ws.send(JSON.stringify({ op: 9, d: false }));
+        conn.ready = true;
+        for (const frame of session.buffer.filter((f) => f.s > p.d.seq)) ws.send(JSON.stringify(frame));
+        ws.send(JSON.stringify({ op: 0, t: "RESUMED", d: {}, s: ++session.seq }));
+      }
+    });
+    ws.on("close", () => state.gateway.sockets.delete(conn));
+  }
+
+  function storeMessage(channelId, payload, author) {
+    const dmUser = dmUserOf(channelId);
+    const msg = {
+      id: nextId(),
+      channel_id: channelId,
+      dm_user: dmUser,
+      author,
+      type: payload.message_reference ? 19 : 0,
+      ...payload,
+      edits: 0,
+      reactions: [],
+    };
+    state.messages.set(msg.id, msg);
+    // Discord tells the bot about every DM message, including its own.
+    if (dmUser) {
+      gatewayDispatch("MESSAGE_CREATE", {
+        id: msg.id,
+        channel_id: channelId,
+        type: msg.type,
+        author,
+        content: msg.content ?? "",
+        attachments: msg.attachments ?? [],
+        sticker_items: msg.sticker_items,
+        message_reference: msg.message_reference,
+      });
+    }
+    return msg;
+  }
 
   const member = (id) => ({ user: USERS[id], nick: null, roles: [] });
   const send = (res, status, body) => {
@@ -163,7 +259,39 @@ export function createFakeDiscord({ publicKeyHex, privateKey }) {
     const method = req.method;
     state.requests.push({ method, path, body });
 
-    // test control
+    // test control: what Discord does with an interaction response
+    if (path === "/__interaction" && method === "POST") {
+      const { token, channelId, messageId, create, update, deferred } = body;
+      let originalId = messageId ?? null;
+      if (create || deferred) originalId = storeMessage(channelId, create ?? { content: "…", flags: 64 }, USERS[IDS.bot]).id;
+      if (update && messageId) {
+        const msg = state.messages.get(messageId);
+        if (msg) Object.assign(msg, update, { edits: msg.edits + 1 });
+      }
+      state.webhooks.set(token, { channelId, originalId, followups: 0 });
+      return send(res, 200, { originalId });
+    }
+    // test control: someone types in their DM with the bot (optionally without telling the Gateway)
+    if (path === "/__dm" && method === "POST") {
+      const { from, content, replyTo, quiet } = body;
+      const channelId = dmChannelFor(from);
+      const payload = { content };
+      if (replyTo) payload.message_reference = { message_id: replyTo };
+      if (quiet) {
+        const session = state.gateway.session;
+        state.gateway.session = null; // stored but not dispatched
+        const msg = storeMessage(channelId, payload, USERS[from]);
+        state.gateway.session = session;
+        return send(res, 200, msg);
+      }
+      return send(res, 200, storeMessage(channelId, payload, USERS[from]));
+    }
+    if (path === "/__gateway" && method === "POST") {
+      if (body.close) for (const conn of state.gateway.sockets) conn.ws.close(body.close, "test");
+      if (body.dispatch) gatewayDispatch(body.dispatch.t, body.dispatch.d);
+      return send(res, 200, { ok: true });
+    }
+
     if (path === "/__state") {
       if (method === "POST") Object.assign(state, body);
       return send(res, 200, {
@@ -203,6 +331,31 @@ export function createFakeDiscord({ publicKeyHex, privateKey }) {
       return send(res, 200, { access_token: `tok-${uid}`, token_type: "Bearer", expires_in: 604800, scope: "identify" });
     }
 
+    // interaction webhooks: authorized by the token in the URL
+    let w;
+    if ((w = p.match(/^\/webhooks\/(\d+)\/([^/]+)(\/messages\/@original)?$/))) {
+      const hook = state.webhooks.get(w[2]);
+      if (w[1] !== IDS.app || !hook) return send(res, 404, { code: 10015, message: "Unknown Webhook" });
+      if (method === "POST" && !w[3]) {
+        if (hook.followups >= 5) return send(res, 400, { code: 40094, message: "This interaction has hit the maximum number of follow up messages" });
+        const errors = validateMessage(body);
+        if (errors.length) return invalid(res, errors);
+        hook.followups++;
+        const msg = storeMessage(hook.channelId, body, USERS[IDS.bot]);
+        return send(res, 200, { id: msg.id, channel_id: msg.channel_id });
+      }
+      if (w[3] && (method === "PATCH" || method === "GET")) {
+        const msg = state.messages.get(hook.originalId);
+        if (!msg) return send(res, 404, { code: 10008, message: "Unknown Message" });
+        if (method === "PATCH") {
+          const errors = validateMessage({ ...msg, ...body });
+          if (errors.length) return invalid(res, errors);
+          Object.assign(msg, body, { edits: msg.edits + 1 });
+        }
+        return send(res, 200, { id: msg.id, channel_id: msg.channel_id });
+      }
+    }
+
     // user (Bearer) endpoints
     if (auth.startsWith("Bearer ")) {
       const uid = auth.slice("Bearer tok-".length);
@@ -223,10 +376,23 @@ export function createFakeDiscord({ publicKeyHex, privateKey }) {
         state.app.interactions_endpoint_url = body.interactions_endpoint_url;
       }
       if (body.flags !== undefined) state.app.flags = body.flags;
+      if (body.integration_types_config !== undefined) state.app.integration_types_config = body.integration_types_config;
       return send(res, 200, state.app);
     }
     if ((m = p.match(/^\/applications\/(\d+)\/commands$/))) {
-      if (method === "PUT") state.commands = body.map((c) => ({ ...c, id: nextId() }));
+      if (method === "PUT") {
+        const supported = Object.keys(state.app.integration_types_config ?? {}).map(Number);
+        const bad = body.filter((c) => (c.integration_types ?? [0]).some((t) => !supported.includes(t)));
+        if (bad.length) return invalid(res, [`integration_types not supported by the app: ${bad.map((c) => c.name)}`]);
+        for (const c of body) {
+          if (c.description.length > 100) return invalid(res, [`description too long: ${c.name}`]);
+          for (const o of c.options ?? []) {
+            if (o.description.length > 100 || (o.choices ?? []).length > 25) return invalid(res, [`bad option ${o.name}`]);
+            for (const ch of o.choices ?? []) if (ch.name.length > 100 || ch.value.length > 100) return invalid(res, [`bad choice ${ch.name}`]);
+          }
+        }
+        state.commands = body.map((c) => ({ ...c, id: nextId() }));
+      }
       return send(res, 200, state.commands);
     }
     if ((m = p.match(/^\/guilds\/(\d+)$/))) {
@@ -268,18 +434,31 @@ export function createFakeDiscord({ publicKeyHex, privateKey }) {
     if (p === "/users/@me/channels" && method === "POST") {
       const uid = body.recipient_id;
       if (!USERS[uid]) return send(res, 400, { code: 50035, message: "Invalid Form Body" });
-      if (!dmChannels.has(uid)) dmChannels.set(uid, nextId());
-      return send(res, 200, { id: dmChannels.get(uid), type: 1, recipients: [USERS[uid]] });
+      return send(res, 200, { id: dmChannelFor(uid), type: 1, recipients: [USERS[uid]] });
+    }
+    if ((m = p.match(/^\/channels\/(\d+)\/messages\/(\d+)\/reactions\/([^/]+)\/@me$/)) && method === "PUT") {
+      const msg = state.messages.get(m[2]);
+      if (!msg || msg.channel_id !== m[1]) return send(res, 404, { code: 10008, message: "Unknown Message" });
+      msg.reactions.push(decodeURIComponent(m[3]));
+      return send(res, 204);
+    }
+    if ((m = p.match(/^\/channels\/(\d+)\/messages$/)) && method === "GET") {
+      const after = BigInt(url.searchParams.get("after") ?? "0");
+      const limit = Number(url.searchParams.get("limit") ?? 50);
+      const list = [...state.messages.values()]
+        .filter((x) => x.channel_id === m[1] && BigInt(x.id) > after)
+        .sort((a, b) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1))
+        .slice(0, limit);
+      return send(res, 200, list);
     }
     if ((m = p.match(/^\/channels\/(\d+)\/messages$/)) && method === "POST") {
       const channelId = m[1];
-      const dmUser = [...dmChannels.entries()].find(([, cid]) => cid === channelId)?.[0];
+      const dmUser = dmUserOf(channelId);
       if (dmUser && state.dmClosed.has(dmUser)) return send(res, 403, { code: 50007, message: "Cannot send messages to this user" });
       if (!dmUser && channelId !== IDS.general) return send(res, 404, { code: 10003, message: "Unknown Channel" });
       const errors = validateMessage(body);
       if (errors.length) return invalid(res, errors);
-      const msg = { id: nextId(), channel_id: channelId, dm_user: dmUser ?? null, ...body, edits: 0 };
-      state.messages.set(msg.id, msg);
+      const msg = storeMessage(channelId, body, USERS[IDS.bot]);
       return send(res, 200, { id: msg.id, channel_id: channelId });
     }
     if ((m = p.match(/^\/channels\/(\d+)\/messages\/(\d+)$/)) && method === "PATCH") {
@@ -293,11 +472,24 @@ export function createFakeDiscord({ publicKeyHex, privateKey }) {
     return send(res, 404, { code: 0, message: `fake: no route for ${method} ${p}` });
   });
 
+  const wss = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (req, socket, head) => wss.handleUpgrade(req, socket, head, onGatewaySocket));
+
   return {
     state,
     server,
-    listen: (port) => new Promise((resolve) => server.listen(port, "127.0.0.1", resolve)),
-    close: () => new Promise((resolve) => server.close(resolve)),
+    dmChannelFor,
+    listen: (port) =>
+      new Promise((resolve) => {
+        state.port = port;
+        server.listen(port, "127.0.0.1", resolve);
+      }),
+    close: () =>
+      new Promise((resolve) => {
+        for (const conn of state.gateway.sockets) conn.ws.terminate();
+        wss.close();
+        server.close(resolve);
+      }),
   };
 }
 

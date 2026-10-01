@@ -173,12 +173,18 @@ function fieldValue(text: string): string {
  * Renders the official summons. `addressees` are the invites this particular message is
  * addressed to: one for a DM, all of them for a shared channel post.
  */
+export interface RenderOptions {
+  /** The bot forwards DM replies to the issuer; say so on summonses delivered by DM. */
+  relay?: boolean;
+}
+
 export function renderSummons(
   s: Summons,
   invites: Invite[],
   addressees: Invite[],
   bureau: string,
   now = Date.now(),
+  opts: RenderOptions = {},
 ): MessagePayload {
   const ids = addressees.map((i) => i.recipient.id);
   const mentions = ids.map(mention).join(" ");
@@ -189,6 +195,9 @@ export function renderSummons(
   if (s.status === "cancelled") content = `🗂️ **SUMMONS WITHDRAWN** — ${mentions}, this summons was cancelled by the issuing officer.`;
   else if (s.status === "closed") content = `📁 **FILE CLOSED** — ${mentions}, this summons is no longer accepting responses.`;
   else content = `📨 **OFFICIAL SUMMONS** — ${mentions}, your presence has been formally requested. A response is required.`;
+  if (opts.relay && s.status === "active" && personal?.deliveredVia === "dm") {
+    content += `\n-# 💬 Questions? Reply to this message and the Bureau will pass it on to ${clip(s.organizer.name, 40)}.`;
+  }
 
   const description = [`**${clip(s.title, 200)}**`];
   if (s.objective) description.push("", quote(clip(s.objective, 1000)));
@@ -239,10 +248,30 @@ export function renderSummons(
     timestamp: new Date(s.createdAt).toISOString(),
   };
 
+  const components = [responseRow(s, !active)];
+  if (s.delivery === "interaction" && active && personal) {
+    // Posted in a chat both people can see: the issuer rules on extensions and rings the bell right there.
+    if (personal.status === "extend" && !personal.verdict) {
+      components.push({
+        type: 1,
+        components: [
+          { type: 2, style: ButtonStyle.Success, label: "Grant extension", emoji: { name: "✅" }, custom_id: `xs:${personal.id}:granted` },
+          { type: 2, style: ButtonStyle.Danger, label: "Deny extension", emoji: { name: "⛔" }, custom_id: `xs:${personal.id}:denied` },
+        ],
+      });
+    }
+    if (personal.status === "pending") {
+      components.push({
+        type: 1,
+        components: [{ type: 2, style: ButtonStyle.Secondary, label: "Ring the bell (issuer only)", emoji: { name: "🔔" }, custom_id: `n:${s.id}` }],
+      });
+    }
+  }
+
   return {
     content,
     embeds: [embed],
-    components: [responseRow(s, !active)],
+    components,
     allowed_mentions: { parse: [], users: ids },
   };
 }
@@ -350,6 +379,7 @@ export function renderResponseNotice(
   invite: Invite,
   previous: InviteStatus,
   bureau: string,
+  opts: RenderOptions = {},
 ): MessagePayload {
   const info = STATUS_INFO[invite.status];
   const option = invite.status === "pending" ? null : optionFor(s, invite.status);
@@ -367,8 +397,10 @@ export function renderResponseNotice(
   }
   buttons.push(linkButton("Open dossier", dossierUrl(s), "🗂️"));
 
+  let content = `📬 **Response received** — ${mention(invite.recipient.id)} answered summons **${s.ref}**`;
+  if (opts.relay) content += `\n-# 💬 Reply to this message to answer ${clip(invite.recipient.name, 40)}.`;
   return {
-    content: `📬 **Response received** — ${mention(invite.recipient.id)} answered summons **${s.ref}**`,
+    content,
     embeds: [
       {
         author: { name: clip(`${bureau.toUpperCase()} · RESPONSE DESK`, 256), icon_url: sealUrl(s.origin) },
@@ -425,8 +457,8 @@ const NUDGE_LINES = [
 
 const NUDGE_TITLES = ["📮 SECOND NOTICE", "⚠️ THIRD NOTICE", "🔔 FOURTH NOTICE", "🔔 FIFTH NOTICE", "🔔 SIXTH NOTICE"];
 
-/** `n` is how many follow-up notices were sent before this one. */
-export function renderNudge(s: Summons, invite: Invite, n: number, final: boolean): MessagePayload {
+/** `n` is how many follow-up notices were sent before this one. `inChat` notices sit right under the summons. */
+export function renderNudge(s: Summons, invite: Invite, n: number, final: boolean, inChat = false): MessagePayload {
   const title = final ? "🚨 FINAL NOTICE" : NUDGE_TITLES[Math.min(n, NUDGE_TITLES.length - 1)]!;
   const line = final
     ? "This is your final notice. Failure to respond will be escalated to the group chat."
@@ -441,7 +473,7 @@ export function renderNudge(s: Summons, invite: Invite, n: number, final: boolea
         footer: { text: `Ref. ${s.ref} · Notice ${n + 2}` },
       },
     ],
-    components: jumpRow(s, invite, "Respond now"),
+    components: inChat ? [] : jumpRow(s, invite, "Respond now"),
     allowed_mentions: { parse: [], users: [invite.recipient.id] },
   };
 }
@@ -488,6 +520,80 @@ export function renderCancelNotice(s: Summons, invite: Invite): MessagePayload {
   return {
     content: `🗂️ **Summons withdrawn** — **${s.ref}** “${clip(s.title, 150)}” was cancelled by the issuing officer. You are released from duty.`,
     components: jumpRow(s, invite, "View summons"),
+    allowed_mentions: { parse: [] },
+  };
+}
+
+// --- notices posted in the chat where /summon was used -------------------------------------
+
+export function renderInChatResponse(s: Summons, invite: Invite): MessagePayload {
+  const info = STATUS_INFO[invite.status];
+  const lines = [`📬 ${mention(s.organizer.id)} — **${clip(invite.recipient.name, 60)}** answered: ${statusEmoji(s, invite.status)} **${info.label}**`];
+  if (invite.note) lines.push(quote(`“${clip(invite.note, 300)}”`));
+  return { content: clip(lines.join("\n"), 2000), allowed_mentions: { parse: [], users: [s.organizer.id] } };
+}
+
+export function renderInChatVerdict(s: Summons, invite: Invite): MessagePayload {
+  const granted = invite.verdict === "granted";
+  return {
+    content: granted
+      ? `⚖️ ${mention(invite.recipient.id)} — your extension request was **GRANTED**. Report at your earliest convenience.`
+      : `⚖️ ${mention(invite.recipient.id)} — your extension request was **DENIED**. Report as originally scheduled: ${ts(s.startsAt, "t")}.`,
+    allowed_mentions: { parse: [], users: [invite.recipient.id] },
+  };
+}
+
+export function renderInChatCancel(s: Summons, invite: Invite): MessagePayload {
+  return {
+    content: `🗂️ ${mention(invite.recipient.id)} — summons **${s.ref}** was withdrawn by the issuing officer. You are released from duty.`,
+    allowed_mentions: { parse: [], users: [invite.recipient.id] },
+  };
+}
+
+// --- the DM relay ---------------------------------------------------------------------------
+
+export function renderForward(
+  from: string,
+  content: string,
+  attachments: { url: string; filename: string }[],
+  stickers: string[],
+  ref: string | null,
+): MessagePayload {
+  const name = clip(from, 60);
+  const text = content.trim();
+  const lines: string[] = [];
+  if (text && !text.includes("\n")) lines.push(`💬 **${name}:** ${text}`);
+  else if (text) lines.push(`💬 **${name}:**`, quote(text));
+  else lines.push(`💬 **${name}** sent:`);
+  for (const s of stickers) lines.push(`*(sticker: ${clip(s, 60)})*`);
+  for (const a of attachments) lines.push(a.url);
+  const footer = `-# ↩️ Reply to this message to answer${ref ? ` · re: ${ref}` : ""}`;
+  // Discord's 2000-character limit; leave room for emoji that count double in some measures.
+  const body = clip(lines.join("\n"), 1990 - footer.length);
+  return { content: `${body}\n${footer}`, allowed_mentions: { parse: [] } };
+}
+
+export function renderUnreachable(s: Summons, invite: Invite): MessagePayload {
+  return {
+    content:
+      `📪 **The Bureau can't reach ${clip(invite.recipient.name, 60)} any more** (re: **${s.ref}**).\n` +
+      "They may have blocked the bot, left the server, or turned off DMs. Further notices are stopped; you'll have to ask them yourself.",
+    allowed_mentions: { parse: [] },
+  };
+}
+
+export function renderRelayHelp(): MessagePayload {
+  return {
+    content:
+      "🏛️ **The Bureau isn't sure who this is for.**\n" +
+      "Reply to a summons or a forwarded message (long-press it → **Reply**) and the Bureau will pass your message on.",
+    allowed_mentions: { parse: [] },
+  };
+}
+
+export function renderRelayFailed(to: string): MessagePayload {
+  return {
+    content: `⚠️ The Bureau couldn't deliver that to **${clip(to, 60)}**: the bot can't DM them (they may have left the server or closed their DMs).`,
     allowed_mentions: { parse: [] },
   };
 }

@@ -4,3 +4,8 @@ import type { Env } from "./env";
 export function bureauStub(env: Env) {
   return env.BUREAU.get(env.BUREAU.idFromName("bureau"));
 }
+
+/** The single live connection to Discord's Gateway, used to hear DMs sent to the bot. */
+export function gatewayStub(env: Env) {
+  return env.GATEWAY.get(env.GATEWAY.idFromName("gateway"));
+}

@@ -2,7 +2,8 @@ export type ResponseKind = "yes" | "no" | "excuse" | "extend";
 export type InviteStatus = "pending" | ResponseKind;
 export type SummonsStatus = "active" | "cancelled" | "closed";
 export type Priority = "routine" | "elevated" | "high" | "critical";
-export type Delivery = "dm" | "channel";
+/** "interaction": posted by /summon in whatever chat it was used in (often a personal DM). */
+export type Delivery = "dm" | "channel" | "interaction";
 export type Escalation = "off" | "gentle" | "standard" | "relentless";
 export type Verdict = "granted" | "denied";
 
@@ -122,7 +123,7 @@ export interface Invite {
   id: string;
   summonsId: string;
   recipient: Person;
-  deliveredVia: "pending" | "dm" | "channel" | "failed";
+  deliveredVia: "pending" | "dm" | "channel" | "failed" | "interaction";
   channelId: string | null;
   messageId: string | null;
   status: InviteStatus;
@@ -217,7 +218,7 @@ export function validateDraft(input: unknown, now: number): SummonsDraft {
     respondBy = int(d.respondBy, "respondBy", now, startsAt + durationMin * 60_000);
   }
 
-  const delivery = oneOf(d.delivery ?? "dm", "delivery", ["dm", "channel"] as const);
+  const delivery = oneOf(d.delivery ?? "dm", "delivery", ["dm", "channel"] as const) as Delivery;
   const channelId = d.channelId ? snowflake(d.channelId, "channelId") : null;
   if (delivery === "channel" && !channelId) throw new ValidationError("Pick a channel to post the summons in", "channelId");
 

@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { DiscordApi, DiscordError, ERR_INVALID_FORM, ERR_UNKNOWN_MESSAGE, type DiscordMessage } from "./discord";
-import { bureauName, type Env } from "./env";
+import { bureauName, cfg, type Env } from "./env";
 import { randomId } from "./crypto";
 import {
   ESCALATION_INFO,
@@ -23,20 +23,41 @@ import {
   clip,
   renderBriefing,
   renderCancelNotice,
+  renderForward,
+  renderInChatCancel,
+  renderInChatResponse,
+  renderInChatVerdict,
   renderNudge,
+  renderRelayFailed,
+  renderRelayHelp,
   renderReminder,
+  renderUnreachable,
   renderResponseNotice,
   renderSummons,
   renderVerdictNotice,
   withoutButtonEmoji,
   type MessagePayload,
 } from "./messages";
+import { laterId, snowflakeAt, toIncomingDm, type IncomingDm, type RelayOutcome } from "./relay";
 
 export interface IssueContext {
   organizer: Person;
   guildName: string;
   recipients: Person[];
   origin: string;
+}
+
+/** /summon used in a chat: the summons is the interaction response itself. */
+export interface HereContext extends IssueContext {
+  channelId: string;
+  guildId: string | null;
+  token: string;
+}
+
+/** The interaction that touched a summons message, if any. Its token can post in that chat for 15 minutes. */
+export interface Via {
+  messageId: string | null;
+  token?: string | null;
 }
 
 export interface DeliveryResult {
@@ -55,12 +76,16 @@ export interface IssueResult {
 export type RespondFailure = "not_found" | "not_recipient" | "inactive" | "option_disabled";
 
 export type RespondResult =
-  | { ok: true; summons: Summons; invites: Invite[]; invite: Invite; changed: boolean }
-  | { ok: false; reason: RespondFailure; summons?: Summons };
+  | { ok: true; summons: Summons; invites: Invite[]; invite: Invite; changed: boolean; relay: boolean }
+  | { ok: false; reason: RespondFailure; summons?: Summons; invites?: Invite[] };
 
 export type VerdictResult =
-  | { ok: true; summons: Summons; invites: Invite[]; invite: Invite }
+  | { ok: true; summons: Summons; invites: Invite[]; invite: Invite; relay: boolean }
   | { ok: false; reason: "not_found" | "not_organizer" | "not_pending" };
+
+export type BellResult =
+  | { ok: true; summons: Summons; invites: Invite[]; invite: Invite }
+  | { ok: false; reason: "not_found" | "not_organizer" | "inactive" | "answered" | "cooldown"; invite?: Invite; summons?: Summons; invites?: Invite[] };
 
 export type OrganizerActionResult = { ok: true; count: number } | { ok: false; reason: string };
 
@@ -69,9 +94,11 @@ export interface DashboardData {
   received: SummonsBundle[];
 }
 
+type OutboxKind = "dm" | "delete_event" | "followup" | "edit_original";
+
 interface OutboxRow {
   id: number;
-  kind: "dm" | "delete_event";
+  kind: OutboxKind;
   payload: string;
   attempts: number;
   summons_id: string | null;
@@ -81,8 +108,21 @@ interface OutboxRow {
 interface DmPayload {
   to: string;
   message: MessagePayload;
+  /** Who a reply to this DM should be forwarded to. */
+  peer?: string | null;
   /** Post here (the message must mention the user) if their DMs are closed. */
   fallbackChannelId?: string | null;
+}
+
+interface WebhookPayload {
+  token: string;
+  message: MessagePayload;
+}
+
+interface ChatToken {
+  token: string;
+  expires: number;
+  followups: number;
 }
 
 const ISSUE_LIMIT_PER_HOUR = 20;
@@ -90,8 +130,17 @@ const MAX_OUTBOX_ATTEMPTS = 5;
 /** Free-plan Workers allow 50 subrequests per invocation; leave headroom. */
 const NETWORK_BUDGET = 40;
 const MANUAL_NUDGE_COOLDOWN_MS = 60_000;
+/** Interaction tokens last 15 minutes; stop using them a little early. */
+const TOKEN_LIFETIME_MS = 14 * 60_000;
+/** Discord allows 5 follow-ups per interaction for apps used outside a server they're installed in. */
+const MAX_FOLLOWUPS = 5;
+/** In-chat notices after /summon or the 🔔: every 4 minutes, up to 3 per interaction. */
+const WINDOW_GAP_MS = 4 * 60_000;
+const WINDOW_NOTICES = 3;
+const PARTNER_TTL_MS = 14 * 86_400_000;
+const HELP_COOLDOWN_MS = 10 * 60_000;
 
-const SCHEMA = `
+const SCHEMA_V1 = `
 CREATE TABLE IF NOT EXISTS summons (
   id TEXT PRIMARY KEY,
   seq INTEGER NOT NULL,
@@ -170,6 +219,34 @@ CREATE TABLE IF NOT EXISTS outbox (
   last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS outbox_due ON outbox(due_at);
+`;
+
+/** v2: /summon in chats (interaction tokens) and the DM relay. */
+const SCHEMA_V2_TABLES = `
+CREATE TABLE IF NOT EXISTS dm_channels (
+  user_id TEXT PRIMARY KEY,
+  channel_id TEXT NOT NULL,
+  last_seen TEXT,
+  active_at INTEGER NOT NULL,
+  help_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS bot_messages (
+  message_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  peer_id TEXT,
+  summons_id TEXT,
+  at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relay_partners (
+  user_id TEXT PRIMARY KEY,
+  partner_id TEXT NOT NULL,
+  summons_id TEXT,
+  at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relay_seen (
+  message_id TEXT PRIMARY KEY,
+  at INTEGER NOT NULL
+);
 `;
 
 type Row = Record<string, SqlStorageValue>;
@@ -257,7 +334,44 @@ export class Bureau extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.sql.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /** Every step is idempotent, so a half-applied upgrade simply runs again. */
+  private migrate() {
+    this.sql.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    const steps: (() => void)[] = [
+      () => this.sql.exec(SCHEMA_V1),
+      () => {
+        this.addColumn("summons", "interaction_token", "TEXT");
+        this.addColumn("summons", "interaction_expires", "INTEGER");
+        this.addColumn("summons", "interaction_followups", "INTEGER NOT NULL DEFAULT 0");
+        this.addColumn("invites", "window_nudges", "INTEGER NOT NULL DEFAULT 0");
+        this.sql.exec(SCHEMA_V2_TABLES);
+      },
+    ];
+    const version = Number(this.getSetting("schema_version") ?? 0);
+    if (version >= steps.length) return;
+    this.ctx.storage.transactionSync(() => {
+      for (let v = version; v < steps.length; v++) steps[v]!();
+      this.setSettingSync("schema_version", String(steps.length));
+    });
+  }
+
+  private addColumn(table: string, column: string, type: string) {
+    const exists = this.sql
+      .exec(`PRAGMA table_info(${table})`)
+      .toArray()
+      .some((c) => c.name === column);
+    if (!exists) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
+
+  private getSetting(key: string): string | null {
+    return sn(this.sql.exec("SELECT value FROM meta WHERE key = ?", key).toArray()[0]?.value);
+  }
+
+  private setSettingSync(key: string, value: string) {
+    this.sql.exec("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, value);
   }
 
   private get api(): DiscordApi {
@@ -266,6 +380,20 @@ export class Bureau extends DurableObject<Env> {
 
   private get bureau(): string {
     return bureauName(this.env);
+  }
+
+  // --- settings ----------------------------------------------------------------------
+
+  relayEnabled(): boolean {
+    return this.getSetting("relay") !== "0";
+  }
+
+  setRelay(enabled: boolean): boolean {
+    const was = this.relayEnabled();
+    this.setSettingSync("relay", enabled ? "1" : "0");
+    // Don't deliver, much later, whatever people typed while forwarding was off.
+    if (enabled && !was) this.sql.exec("UPDATE dm_channels SET last_seen = ?", snowflakeAt(Date.now()));
+    return enabled;
   }
 
   // --- reads -------------------------------------------------------------------------
@@ -328,17 +456,16 @@ export class Bureau extends DurableObject<Env> {
 
   // --- issuing -------------------------------------------------------------------------
 
-  async issue(draft: SummonsDraft, context: IssueContext): Promise<IssueResult> {
-    const now = Date.now();
+  private checkRate(organizerId: string, now: number) {
     const recent = n(
-      this.sql
-        .exec("SELECT COUNT(*) AS c FROM summons WHERE organizer_id = ? AND created_at > ?", context.organizer.id, now - 3_600_000)
-        .one().c,
+      this.sql.exec("SELECT COUNT(*) AS c FROM summons WHERE organizer_id = ? AND created_at > ?", organizerId, now - 3_600_000).one().c,
     );
     if (recent >= ISSUE_LIMIT_PER_HOUR) {
       throw new Error("The Bureau has processed too many summonses from you this hour. Try again later.");
     }
+  }
 
+  private insertSummons(draft: SummonsDraft, context: IssueContext, now: number, token: string | null = null): string {
     const id = randomId(10);
     const seq = n(this.sql.exec("SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM summons").one().next);
     const ref = `BMA-${new Date(now).getUTCFullYear()}-${String(seq).padStart(4, "0")}`;
@@ -350,12 +477,14 @@ export class Bureau extends DurableObject<Env> {
       this.sql.exec(
         `INSERT INTO summons (id, seq, ref, organizer_id, organizer_name, organizer_avatar, guild_id, guild_name,
            classification, title, objective, location, starts_at, duration_min, priority, dress_code, signature_title,
-           respond_by, options, delivery, channel_id, escalation, remind_before_min, reminder_sent, status, origin, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+           respond_by, options, delivery, channel_id, escalation, remind_before_min, reminder_sent, status, origin, created_at,
+           interaction_token, interaction_expires, interaction_followups)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 0)`,
         id, seq, ref, context.organizer.id, context.organizer.name, context.organizer.avatar, draft.guildId, context.guildName,
         draft.classification, draft.title, draft.objective, draft.location, draft.startsAt, draft.durationMin, draft.priority,
         draft.dressCode, draft.signatureTitle, draft.respondBy, JSON.stringify(draft.options), draft.delivery, draft.channelId,
         draft.escalation, draft.remindBeforeMin, reminderSent, context.origin, now,
+        token, token ? now + TOKEN_LIFETIME_MS : null,
       );
       for (const person of context.recipients) {
         this.sql.exec(
@@ -363,13 +492,24 @@ export class Bureau extends DurableObject<Env> {
            VALUES (?, ?, ?, ?, ?, 'pending', 'pending')`,
           randomId(10), id, person.id, person.name, person.avatar,
         );
+        // Anything they type to the bot now goes to whoever summoned them.
+        this.notePartner(person.id, context.organizer.id, id, now);
       }
+      if (context.recipients.length === 1) this.notePartner(context.organizer.id, context.recipients[0]!.id, id, now);
       this.log(id, null, "issued", `Issued by ${context.organizer.name}`, now);
     });
+    return id;
+  }
+
+  async issue(draft: SummonsDraft, context: IssueContext): Promise<IssueResult> {
+    const now = Date.now();
+    this.checkRate(context.organizer.id, now);
+    const id = this.insertSummons(draft, context, now);
 
     const warnings: string[] = [];
     const summons = this.loadSummons(id)!;
     let invites = this.loadInvites(id);
+    const relay = this.relayEnabled();
 
     if (summons.delivery === "channel" && summons.channelId) {
       try {
@@ -385,15 +525,16 @@ export class Bureau extends DurableObject<Env> {
       }
     } else {
       for (const invite of invites) {
-        const message = renderSummons(summons, invites, [invite], this.bureau, now);
+        const asDm = { ...invite, deliveredVia: "dm" as const };
         try {
-          const channel = await this.api.openDm(invite.recipient.id);
-          const msg = await this.send(channel.id, message);
-          this.markDelivered(invite, "dm", channel.id, msg.id);
+          const channelId = await this.dmChannel(invite.recipient.id);
+          const msg = await this.send(channelId, renderSummons(summons, invites, [asDm], this.bureau, now, { relay }));
+          this.markDelivered(invite, "dm", channelId, msg.id);
+          this.trackBotMessage(msg.id, invite.recipient.id, summons.organizer.id, id, now);
         } catch (e) {
           if (e instanceof DiscordError && e.cannotDm && summons.channelId) {
             try {
-              const msg = await this.send(summons.channelId, message);
+              const msg = await this.send(summons.channelId, renderSummons(summons, invites, [invite], this.bureau, now));
               this.markDelivered(invite, "channel", summons.channelId, msg.id);
               this.log(id, invite.id, "dm_closed", `${invite.recipient.name} has DMs closed — posted in the server channel instead`);
               continue;
@@ -436,6 +577,23 @@ export class Bureau extends DurableObject<Env> {
       deliveries: invites.map((i) => ({ recipient: i.recipient, deliveredVia: i.deliveredVia, error: i.error })),
       warnings,
     };
+  }
+
+  /**
+   * /summon used in a chat (often a personal DM): the summons message is the interaction
+   * response, which the Worker sends. Here we only file it and plan the in-chat notices.
+   */
+  async issueHere(draft: SummonsDraft, context: HereContext): Promise<SummonsBundle> {
+    const now = Date.now();
+    this.checkRate(context.organizer.id, now);
+    const id = this.insertSummons({ ...draft, delivery: "interaction", channelId: context.channelId }, context, now, context.token);
+    this.sql.exec(
+      "UPDATE invites SET delivered_via = 'interaction', channel_id = ?, next_nudge_at = ? WHERE summons_id = ?",
+      context.channelId, draft.escalation === "off" ? null : now + WINDOW_GAP_MS, id,
+    );
+    this.log(id, null, "delivered", "Posted in the chat where /summon was used");
+    await this.reschedule();
+    return this.loadBundle(id)!;
   }
 
   private markDelivered(invite: Invite, via: "dm" | "channel", channelId: string, messageId: string) {
@@ -481,26 +639,50 @@ export class Bureau extends DurableObject<Env> {
     }
   }
 
+  // --- interaction tokens (posting in the chat where /summon was used) ------------------
+
+  /** Remembers the latest interaction on a /summon message: its token can edit that message and post follow-ups. */
+  private noteVia(summons: Summons, invite: Invite | null, via: Via | null | undefined, now: number) {
+    if (summons.delivery !== "interaction" || !via?.token) return;
+    this.sql.exec(
+      "UPDATE summons SET interaction_token = ?, interaction_expires = ?, interaction_followups = 0 WHERE id = ?",
+      via.token, now + TOKEN_LIFETIME_MS, summons.id,
+    );
+    if (invite && via.messageId) this.sql.exec("UPDATE invites SET message_id = ? WHERE id = ?", via.messageId, invite.id);
+  }
+
+  /** A token that can still post `need` more follow-ups, if there is one. */
+  private chatToken(summonsId: string, now: number, need = 1): ChatToken | null {
+    const r = this.sql
+      .exec("SELECT interaction_token, interaction_expires, interaction_followups FROM summons WHERE id = ?", summonsId)
+      .toArray()[0];
+    if (!r?.interaction_token) return null;
+    const token = { token: s(r.interaction_token), expires: n(r.interaction_expires), followups: n(r.interaction_followups) };
+    if (token.expires - now < 30_000 || token.followups + need > MAX_FOLLOWUPS) return null;
+    return token;
+  }
+
+  private enqueueFollowup(summonsId: string, inviteId: string | null, token: ChatToken, message: MessagePayload, dueAt = Date.now()) {
+    this.sql.exec("UPDATE summons SET interaction_followups = interaction_followups + 1 WHERE id = ?", summonsId);
+    this.enqueue("followup", summonsId, inviteId, { token: token.token, message } satisfies WebhookPayload, dueAt);
+  }
+
   // --- responses ---------------------------------------------------------------------
 
-  async respond(
-    summonsId: string,
-    userId: string,
-    kind: ResponseKind,
-    note: string | null,
-    clickedMessageId: string | null,
-  ): Promise<RespondResult> {
+  async respond(summonsId: string, userId: string, kind: ResponseKind, note: string | null, via: Via | null): Promise<RespondResult> {
     const summons = this.loadSummons(summonsId);
     if (!summons) return { ok: false, reason: "not_found" };
     const row = this.sql.exec("SELECT * FROM invites WHERE summons_id = ? AND recipient_id = ?", summonsId, userId).toArray()[0];
     if (!row) return { ok: false, reason: "not_recipient", summons };
-    if (summons.status !== "active") return { ok: false, reason: "inactive", summons };
+    if (summons.status !== "active") return { ok: false, reason: "inactive", summons, invites: this.loadInvites(summonsId) };
     if (!summons.options.some((o) => o.kind === kind)) return { ok: false, reason: "option_disabled", summons };
 
     const invite = toInvite(row);
     const cleanNote = NEEDS_NOTE[kind] ? clip((note ?? "").trim(), 300) || null : null;
     const changed = invite.status !== kind || invite.note !== cleanNote;
     const now = Date.now();
+    const relay = this.relayEnabled();
+    this.noteVia(summons, invite, via, now);
 
     if (changed) {
       const previous = invite.status;
@@ -512,27 +694,35 @@ export class Bureau extends DurableObject<Env> {
         // Every other message that shows this summons needs re-rendering (roster, tally).
         const marked = this.sql.exec(
           `UPDATE invites SET dirty = 1 WHERE summons_id = ? AND message_id IS NOT NULL AND message_id IS NOT ?`,
-          summonsId, clickedMessageId,
+          summonsId, via?.messageId ?? null,
         ).rowsWritten;
         if (marked > 0) this.markSyncNeeded(summonsId, now + 1_000);
         this.log(summonsId, invite.id, "response", `${invite.recipient.name}: ${kind}${cleanNote ? ` — “${cleanNote}”` : ""}`, now);
+        this.notePartner(summons.organizer.id, invite.recipient.id, summonsId, now);
       });
 
       const invites = this.loadInvites(summonsId);
       const updated = invites.find((i) => i.id === invite.id)!;
-      this.enqueueDm(summonsId, invite.id, {
-        to: summons.organizer.id,
-        message: renderResponseNotice(summons, invites, updated, previous, this.bureau),
-      });
+      const token = summons.delivery === "interaction" ? this.chatToken(summonsId, now) : null;
+      if (token) {
+        // They answered in the shared chat; tell the issuer right there (an edit alone doesn't notify).
+        this.enqueueFollowup(summonsId, invite.id, token, renderInChatResponse(summons, updated));
+      } else {
+        this.enqueueDm(summonsId, invite.id, {
+          to: summons.organizer.id,
+          peer: invite.recipient.id,
+          message: renderResponseNotice(summons, invites, updated, previous, this.bureau, { relay }),
+        });
+      }
       await this.reschedule();
-      return { ok: true, summons, invites, invite: updated, changed };
+      return { ok: true, summons, invites, invite: updated, changed, relay };
     }
 
     const invites = this.loadInvites(summonsId);
-    return { ok: true, summons, invites, invite: invites.find((i) => i.id === invite.id)!, changed };
+    return { ok: true, summons, invites, invite: invites.find((i) => i.id === invite.id)!, changed, relay };
   }
 
-  async verdict(inviteId: string, userId: string, verdict: Verdict): Promise<VerdictResult> {
+  async verdict(inviteId: string, userId: string, verdict: Verdict, via: Via | null = null): Promise<VerdictResult> {
     const row = this.sql.exec("SELECT * FROM invites WHERE id = ?", inviteId).toArray()[0];
     if (!row) return { ok: false, reason: "not_found" };
     const invite = toInvite(row);
@@ -540,21 +730,57 @@ export class Bureau extends DurableObject<Env> {
     if (!summons) return { ok: false, reason: "not_found" };
     if (summons.organizer.id !== userId) return { ok: false, reason: "not_organizer" };
     if (invite.status !== "extend" || summons.status !== "active") return { ok: false, reason: "not_pending" };
+    const now = Date.now();
+    this.noteVia(summons, invite, via, now);
 
     if (invite.verdict !== verdict) {
       this.sql.exec("UPDATE invites SET verdict = ?, dirty = CASE WHEN message_id IS NULL THEN 0 ELSE 1 END WHERE id = ?", verdict, inviteId);
       this.log(summons.id, inviteId, "verdict", `Extension for ${invite.recipient.name} ${verdict}`);
       const updated = { ...invite, verdict };
-      this.enqueueDm(summons.id, inviteId, {
-        to: invite.recipient.id,
-        message: renderVerdictNotice(summons, updated),
-        fallbackChannelId: invite.deliveredVia === "channel" ? invite.channelId : null,
-      });
-      this.markSyncNeeded(summons.id, Date.now() + 1_000);
+      const token = summons.delivery === "interaction" ? this.chatToken(summons.id, now) : null;
+      if (token) {
+        this.enqueueFollowup(summons.id, inviteId, token, renderInChatVerdict(summons, updated));
+      } else {
+        this.enqueueDm(summons.id, inviteId, {
+          to: invite.recipient.id,
+          peer: summons.organizer.id,
+          message: renderVerdictNotice(summons, updated),
+          fallbackChannelId: invite.deliveredVia === "channel" ? invite.channelId : null,
+        });
+      }
+      if (summons.delivery !== "interaction") this.markSyncNeeded(summons.id, now + 1_000);
+      else this.sql.exec("UPDATE invites SET dirty = 0 WHERE id = ?", inviteId); // the click response re-renders it
       await this.reschedule();
     }
     const invites = this.loadInvites(summons.id);
-    return { ok: true, summons, invites, invite: invites.find((i) => i.id === inviteId)! };
+    return { ok: true, summons, invites, invite: invites.find((i) => i.id === inviteId)!, relay: this.relayEnabled() };
+  }
+
+  /** 🔔 on a /summon message: an immediate notice in the chat, then a fresh round of automatic ones. */
+  async ringBell(summonsId: string, userId: string, via: Via): Promise<BellResult> {
+    const summons = this.loadSummons(summonsId);
+    if (!summons) return { ok: false, reason: "not_found" };
+    const invites = this.loadInvites(summonsId);
+    const invite = invites[0];
+    if (!invite) return { ok: false, reason: "not_found" };
+    if (summons.organizer.id !== userId) return { ok: false, reason: "not_organizer" };
+    if (summons.status !== "active") return { ok: false, reason: "inactive", summons, invites };
+    if (invite.status !== "pending") return { ok: false, reason: "answered", invite };
+    const now = Date.now();
+    const last = this.sql.exec("SELECT MAX(at) AS at FROM log WHERE summons_id = ? AND kind = 'manual_nudge'", summonsId).one().at;
+    if (last != null && now - Number(last) < MANUAL_NUDGE_COOLDOWN_MS) return { ok: false, reason: "cooldown" };
+
+    this.noteVia(summons, invite, via, now);
+    const token = this.chatToken(summonsId, now);
+    if (token) this.enqueueFollowup(summonsId, invite.id, token, renderNudge(summons, invite, invite.nudgesSent, false, true));
+    this.sql.exec(
+      "UPDATE invites SET nudges_sent = nudges_sent + 1, window_nudges = window_nudges + 1, next_nudge_at = ? WHERE id = ?",
+      Math.min(now + WINDOW_GAP_MS, nudgeCutoff(summons)), invite.id,
+    );
+    this.log(summonsId, invite.id, "manual_nudge", `🔔 Bell rung: notice sent to ${invite.recipient.name} in the chat`, now);
+    await this.reschedule();
+    const fresh = this.loadInvites(summonsId);
+    return { ok: true, summons, invites: fresh, invite: fresh[0]! };
   }
 
   // --- organizer actions -------------------------------------------------------------
@@ -567,7 +793,9 @@ export class Bureau extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       this.sql.exec("UPDATE summons SET status = 'cancelled', ended_at = ? WHERE id = ?", now, summonsId);
       this.sql.exec(
-        "UPDATE invites SET next_nudge_at = NULL, dirty = CASE WHEN message_id IS NULL THEN 0 ELSE 1 END WHERE summons_id = ?",
+        `UPDATE invites SET next_nudge_at = NULL,
+           dirty = CASE WHEN message_id IS NULL AND delivered_via != 'interaction' THEN 0 ELSE 1 END
+         WHERE summons_id = ?`,
         summonsId,
       );
       this.log(summonsId, null, "cancelled", "Cancelled by the issuing officer", now);
@@ -576,11 +804,17 @@ export class Bureau extends DurableObject<Env> {
     let count = 0;
     for (const invite of this.loadInvites(summonsId)) {
       if (invite.status === "no" || invite.deliveredVia === "failed" || invite.deliveredVia === "pending") continue;
-      this.enqueueDm(summonsId, invite.id, {
-        to: invite.recipient.id,
-        message: renderCancelNotice(cancelled, invite),
-        fallbackChannelId: invite.deliveredVia === "channel" ? invite.channelId : null,
-      });
+      const token = invite.deliveredVia === "interaction" ? this.chatToken(summonsId, now, 2) : null;
+      if (token) {
+        this.enqueueFollowup(summonsId, invite.id, token, renderInChatCancel(cancelled, invite));
+      } else {
+        this.enqueueDm(summonsId, invite.id, {
+          to: invite.recipient.id,
+          peer: summons.organizer.id,
+          message: renderCancelNotice(cancelled, invite),
+          fallbackChannelId: invite.deliveredVia === "channel" ? invite.channelId : null,
+        });
+      }
       count++;
     }
     if (summons.scheduledEventId) {
@@ -605,18 +839,165 @@ export class Bureau extends DurableObject<Env> {
     let count = 0;
     for (const invite of this.loadInvites(summonsId)) {
       if (invite.status !== "pending" || invite.deliveredVia === "failed" || invite.deliveredVia === "pending") continue;
-      this.enqueueDm(summonsId, invite.id, {
-        to: invite.recipient.id,
-        message: renderNudge(summons, invite, invite.nudgesSent, false),
-        fallbackChannelId: summons.channelId,
-      });
-      this.sql.exec("UPDATE invites SET nudges_sent = nudges_sent + 1 WHERE id = ?", invite.id);
+      this.sendNudge(summons, invite, invite.nudgesSent, false, now);
       count++;
     }
     if (!count) return { ok: false, reason: "Nobody is waiting to respond." };
     this.log(summonsId, null, "manual_nudge", `Reminder sent to ${count} ${count === 1 ? "person" : "people"}`, now);
     await this.reschedule();
     return { ok: true, count };
+  }
+
+  /** In the shared chat when /summon's token still works, otherwise by the bot's DM. */
+  private sendNudge(summons: Summons, invite: Invite, n: number, final: boolean, now: number) {
+    const token = invite.deliveredVia === "interaction" ? this.chatToken(summons.id, now) : null;
+    if (token) {
+      this.enqueueFollowup(summons.id, invite.id, token, renderNudge(summons, invite, n, final, true), now);
+      this.sql.exec("UPDATE invites SET nudges_sent = nudges_sent + 1, window_nudges = window_nudges + 1 WHERE id = ?", invite.id);
+      return;
+    }
+    this.enqueueDm(summons.id, invite.id, {
+      to: invite.recipient.id,
+      peer: summons.organizer.id,
+      message: renderNudge(summons, invite, n, final),
+      fallbackChannelId: summons.delivery === "interaction" ? null : summons.channelId,
+    }, now);
+    this.sql.exec("UPDATE invites SET nudges_sent = nudges_sent + 1 WHERE id = ?", invite.id);
+  }
+
+  // --- the DM relay --------------------------------------------------------------------
+
+  /** Someone typed in their DM with the bot: pass it on to whoever they're dealing with. */
+  async relayIncoming(m: IncomingDm): Promise<RelayOutcome> {
+    if (!this.relayEnabled()) return "ignored";
+    const now = Date.now();
+    const fresh = this.sql.exec("INSERT OR IGNORE INTO relay_seen (message_id, at) VALUES (?, ?)", m.id, now).rowsWritten;
+    if (!fresh) return "duplicate";
+    this.noteDmChannel(m.author.id, m.channelId, now, m.id);
+
+    const route = this.routeFor(m.author.id, m.replyTo, now);
+    if (!route) {
+      const r = this.sql.exec("SELECT help_at FROM dm_channels WHERE user_id = ?", m.author.id).toArray()[0];
+      if (!r?.help_at || now - n(r.help_at) > HELP_COOLDOWN_MS) {
+        this.sql.exec("UPDATE dm_channels SET help_at = ? WHERE user_id = ?", now, m.author.id);
+        await this.send(m.channelId, renderRelayHelp()).catch((e) => console.error("relay help failed", e));
+      }
+      return "help";
+    }
+
+    const ref = route.summonsId ? this.loadSummons(route.summonsId)?.ref ?? null : null;
+    try {
+      const channelId = await this.dmChannel(route.to);
+      const sent = await this.send(channelId, renderForward(m.author.name, m.content, m.attachments, m.stickers, ref));
+      this.trackBotMessage(sent.id, route.to, m.author.id, route.summonsId, now);
+      this.notePartner(m.author.id, route.to, route.summonsId, now);
+      this.notePartner(route.to, m.author.id, route.summonsId, now);
+      await this.api.addReaction(m.channelId, m.id, "📨").catch(() => undefined);
+      return "forwarded";
+    } catch (e) {
+      if (e instanceof DiscordError && e.cannotDm) {
+        await this.send(m.channelId, renderRelayFailed(this.nameOf(route.to))).catch(() => undefined);
+        return "failed";
+      }
+      // Let a later catch-up try again.
+      if (isRetryable(e)) this.sql.exec("DELETE FROM relay_seen WHERE message_id = ?", m.id);
+      throw e;
+    }
+  }
+
+  /** After a fresh Gateway session: forward whatever people typed while we weren't listening. */
+  async relayCatchUp(): Promise<number> {
+    if (!this.relayEnabled()) return 0;
+    const now = Date.now();
+    const channels = this.sql
+      .exec(
+        "SELECT user_id, channel_id, last_seen FROM dm_channels WHERE last_seen IS NOT NULL AND active_at > ? ORDER BY active_at DESC LIMIT 10",
+        now - 7 * 86_400_000,
+      )
+      .toArray();
+    let forwarded = 0;
+    for (const c of channels) {
+      if (forwarded >= 8) break;
+      let messages;
+      try {
+        messages = await this.api.channelMessages(s(c.channel_id), s(c.last_seen), 20);
+      } catch (e) {
+        console.error("catch-up fetch failed", e);
+        continue;
+      }
+      const missed = messages
+        .map((m) => toIncomingDm({ ...m, channel_id: m.channel_id ?? s(c.channel_id) }))
+        .filter((m): m is IncomingDm => m !== null)
+        .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+      for (const m of missed) {
+        if (forwarded >= 8) break;
+        try {
+          if ((await this.relayIncoming(m)) === "forwarded") forwarded++;
+        } catch (e) {
+          console.error("catch-up relay failed", e);
+        }
+      }
+    }
+    return forwarded;
+  }
+
+  /** A reply goes to whoever the replied-to message came from; otherwise to the person they last dealt with. */
+  private routeFor(userId: string, replyTo: string | null, now: number): { to: string; summonsId: string | null } | null {
+    if (replyTo) {
+      const r = this.sql.exec("SELECT peer_id, summons_id FROM bot_messages WHERE message_id = ? AND user_id = ?", replyTo, userId).toArray()[0];
+      if (r?.peer_id) return { to: s(r.peer_id), summonsId: sn(r.summons_id) };
+    }
+    const p = this.sql.exec("SELECT partner_id, summons_id FROM relay_partners WHERE user_id = ? AND at > ?", userId, now - PARTNER_TTL_MS).toArray()[0];
+    return p ? { to: s(p.partner_id), summonsId: sn(p.summons_id) } : null;
+  }
+
+  private nameOf(userId: string): string {
+    const r = this.sql
+      .exec(
+        `SELECT name FROM (
+           SELECT organizer_name AS name, created_at AS at FROM summons WHERE organizer_id = ?
+           UNION ALL SELECT i.recipient_name, s.created_at FROM invites i JOIN summons s ON s.id = i.summons_id WHERE i.recipient_id = ?
+         ) ORDER BY at DESC LIMIT 1`,
+        userId, userId,
+      )
+      .toArray()[0];
+    return r ? s(r.name) : "them";
+  }
+
+  private notePartner(userId: string, partnerId: string, summonsId: string | null, now: number) {
+    this.sql.exec(
+      `INSERT INTO relay_partners (user_id, partner_id, summons_id, at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET partner_id = excluded.partner_id, summons_id = excluded.summons_id, at = excluded.at`,
+      userId, partnerId, summonsId, now,
+    );
+  }
+
+  /** Remembers a user's DM channel with the bot, and the newest message of theirs we've handled. */
+  private noteDmChannel(userId: string, channelId: string, now: number, seenId: string | null) {
+    const r = this.sql.exec("SELECT last_seen FROM dm_channels WHERE user_id = ?", userId).toArray()[0];
+    const lastSeen = seenId ? laterId(sn(r?.last_seen), seenId) : sn(r?.last_seen);
+    this.sql.exec(
+      `INSERT INTO dm_channels (user_id, channel_id, last_seen, active_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET channel_id = excluded.channel_id, last_seen = excluded.last_seen, active_at = excluded.active_at`,
+      userId, channelId, lastSeen, now,
+    );
+  }
+
+  private async dmChannel(userId: string): Promise<string> {
+    const r = this.sql.exec("SELECT channel_id FROM dm_channels WHERE user_id = ?", userId).toArray()[0];
+    if (r) return s(r.channel_id);
+    const channel = await this.api.openDm(userId);
+    this.noteDmChannel(userId, channel.id, Date.now(), null);
+    return channel.id;
+  }
+
+  private trackBotMessage(messageId: string, userId: string, peerId: string | null, summonsId: string | null, now: number) {
+    this.sql.exec(
+      "INSERT OR REPLACE INTO bot_messages (message_id, user_id, peer_id, summons_id, at) VALUES (?, ?, ?, ?, ?)",
+      messageId, userId, peerId, summonsId, now,
+    );
+    // Catch-up starts after the bot's first message in a conversation it hasn't heard back from yet.
+    this.sql.exec("UPDATE dm_channels SET last_seen = COALESCE(last_seen, ?), active_at = ? WHERE user_id = ?", messageId, now, userId);
   }
 
   // --- scheduler ---------------------------------------------------------------------
@@ -640,10 +1021,18 @@ export class Bureau extends DurableObject<Env> {
       let budget = NETWORK_BUDGET;
       budget = await this.flushOutbox(now, budget);
       await this.syncMessages(now, budget);
+      this.prune(now);
     } finally {
       this.running = false;
       await this.reschedule();
     }
+  }
+
+  private prune(now: number) {
+    if (now - Number(this.getSetting("pruned_at") ?? 0) < 3_600_000) return;
+    this.sql.exec("DELETE FROM relay_seen WHERE at < ?", now - 3 * 86_400_000);
+    this.sql.exec("DELETE FROM bot_messages WHERE at < ?", now - 60 * 86_400_000);
+    this.setSettingSync("pruned_at", String(now));
   }
 
   private closeExpired(now: number) {
@@ -655,7 +1044,9 @@ export class Bureau extends DurableObject<Env> {
       this.ctx.storage.transactionSync(() => {
         this.sql.exec("UPDATE summons SET status = 'closed', ended_at = ?, sync_at = ? WHERE id = ?", now, now, id);
         this.sql.exec(
-          "UPDATE invites SET next_nudge_at = NULL, dirty = CASE WHEN message_id IS NULL THEN 0 ELSE 1 END WHERE summons_id = ?",
+          `UPDATE invites SET next_nudge_at = NULL,
+             dirty = CASE WHEN message_id IS NULL AND delivered_via != 'interaction' THEN 0 ELSE 1 END
+           WHERE summons_id = ?`,
           id,
         );
         this.log(id, null, "closed", "File closed: the event is over", now);
@@ -682,12 +1073,17 @@ export class Bureau extends DurableObject<Env> {
         if (!coming) continue;
         this.enqueueDm(summons.id, invite.id, {
           to: invite.recipient.id,
+          peer: summons.organizer.id,
           message: renderReminder(summons, invite),
           fallbackChannelId: invite.deliveredVia === "channel" ? invite.channelId : null,
         }, now);
         count++;
       }
-      this.enqueueDm(summons.id, null, { to: summons.organizer.id, message: renderBriefing(summons, invites, this.bureau) }, now);
+      this.enqueueDm(summons.id, null, {
+        to: summons.organizer.id,
+        peer: invites.length === 1 ? invites[0]!.recipient.id : null,
+        message: renderBriefing(summons, invites, this.bureau),
+      }, now);
       this.log(summons.id, null, "reminder", `Pre-event reminder sent to ${count} confirmed ${count === 1 ? "attendee" : "attendees"}`, now);
     }
   }
@@ -702,25 +1098,52 @@ export class Bureau extends DurableObject<Env> {
       .toArray();
     for (const r of rows) {
       const summons = this.loadSummons(s(r.summons_id))!;
-      const invite = toInvite(this.sql.exec("SELECT * FROM invites WHERE id = ?", s(r.invite_id)).one());
+      const row = this.sql.exec("SELECT * FROM invites WHERE id = ?", s(r.invite_id)).one();
+      const invite = toInvite(row);
       const info = ESCALATION_INFO[summons.escalation];
-      const sent = invite.nudgesSent;
-      if (sent >= info.maxNotices || now >= nudgeCutoff(summons)) {
+      const cutoff = nudgeCutoff(summons);
+      if (now >= cutoff) {
         this.sql.exec("UPDATE invites SET next_nudge_at = NULL WHERE id = ?", invite.id);
         continue;
       }
-      const final = sent + 1 >= info.maxNotices;
+
+      // /summon in a chat: a burst of notices right there while its interaction token lasts.
+      if (invite.deliveredVia === "interaction") {
+        const token = this.chatToken(summons.id, now);
+        if (token && token.followups < WINDOW_NOTICES) {
+          this.enqueueFollowup(summons.id, invite.id, token, renderNudge(summons, invite, invite.nudgesSent, false, true), now);
+          let next: number | null = now + WINDOW_GAP_MS;
+          if (token.followups + 1 >= WINDOW_NOTICES || next > token.expires - 30_000) {
+            // Window over: carry on by the bot's DM, on the normal escalation schedule.
+            next = info.maxNotices ? now + info.intervalMin * 60_000 : null;
+          }
+          this.sql.exec(
+            "UPDATE invites SET nudges_sent = nudges_sent + 1, window_nudges = window_nudges + 1, next_nudge_at = ? WHERE id = ?",
+            next !== null && next < cutoff ? next : null, invite.id,
+          );
+          this.log(summons.id, invite.id, "nudge", `Notice #${invite.nudgesSent + 2} posted in the chat`, now);
+          continue;
+        }
+      }
+
+      const byDm = invite.nudgesSent - n(row.window_nudges);
+      if (byDm >= info.maxNotices) {
+        this.sql.exec("UPDATE invites SET next_nudge_at = NULL WHERE id = ?", invite.id);
+        continue;
+      }
+      const final = byDm + 1 >= info.maxNotices;
       this.enqueueDm(summons.id, invite.id, {
         to: invite.recipient.id,
-        message: renderNudge(summons, invite, sent, final),
-        fallbackChannelId: summons.channelId,
+        peer: summons.organizer.id,
+        message: renderNudge(summons, invite, invite.nudgesSent, final),
+        fallbackChannelId: summons.delivery === "interaction" ? null : summons.channelId,
       }, now);
       const next = now + info.intervalMin * 60_000;
       this.sql.exec(
-        "UPDATE invites SET nudges_sent = ?, next_nudge_at = ? WHERE id = ?",
-        sent + 1, final || next >= nudgeCutoff(summons) ? null : next, invite.id,
+        "UPDATE invites SET nudges_sent = nudges_sent + 1, next_nudge_at = ? WHERE id = ?",
+        final || next >= cutoff ? null : next, invite.id,
       );
-      this.log(summons.id, invite.id, "nudge", `${final ? "Final notice" : `Notice #${sent + 2}`} sent to ${invite.recipient.name}`, now);
+      this.log(summons.id, invite.id, "nudge", `${final ? "Final notice" : `Notice #${invite.nudgesSent + 2}`} sent to ${invite.recipient.name}`, now);
     }
   }
 
@@ -728,7 +1151,7 @@ export class Bureau extends DurableObject<Env> {
     this.enqueue("dm", summonsId, inviteId, payload, dueAt);
   }
 
-  private enqueue(kind: OutboxRow["kind"], summonsId: string | null, inviteId: string | null, payload: unknown, dueAt = Date.now()) {
+  private enqueue(kind: OutboxKind, summonsId: string | null, inviteId: string | null, payload: unknown, dueAt = Date.now()) {
     this.sql.exec(
       "INSERT INTO outbox (due_at, kind, summons_id, invite_id, payload) VALUES (?, ?, ?, ?, ?)",
       dueAt, kind, summonsId, inviteId, JSON.stringify(payload),
@@ -746,18 +1169,25 @@ export class Bureau extends DurableObject<Env> {
     const items = this.sql
       .exec("SELECT id, kind, payload, attempts, summons_id, invite_id FROM outbox WHERE due_at <= ? ORDER BY id LIMIT 20", now)
       .toArray() as unknown as OutboxRow[];
+    const appId = cfg(this.env, "DISCORD_APPLICATION_ID");
     for (const item of items) {
       if (budget < 3) break;
       try {
         if (item.kind === "dm") {
           budget -= 2;
-          await this.deliverDm(JSON.parse(item.payload) as DmPayload, () => budget--);
+          await this.deliverDm(JSON.parse(item.payload) as DmPayload, item.summons_id, () => budget--);
         } else if (item.kind === "delete_event") {
           budget -= 1;
           const p = JSON.parse(item.payload) as { guildId: string; eventId: string };
           await this.api.deleteScheduledEvent(p.guildId, p.eventId).catch((e) => {
             if (!(e instanceof DiscordError && e.status === 404)) throw e;
           });
+        } else if (item.kind === "followup" || item.kind === "edit_original") {
+          budget -= 1;
+          const p = JSON.parse(item.payload) as WebhookPayload;
+          const hooks = DiscordApi.webhooks(this.env);
+          if (item.kind === "followup") await hooks.followup(appId, p.token, p.message);
+          else await hooks.editOriginal(appId, p.token, p.message);
         }
         this.sql.exec("DELETE FROM outbox WHERE id = ?", item.id);
       } catch (e) {
@@ -765,6 +1195,9 @@ export class Bureau extends DurableObject<Env> {
         if (attempts >= MAX_OUTBOX_ATTEMPTS || !isRetryable(e)) {
           this.sql.exec("DELETE FROM outbox WHERE id = ?", item.id);
           if (item.summons_id) this.log(item.summons_id, item.invite_id, "notify_failed", errorText(e));
+          if (item.kind === "dm" && e instanceof DiscordError && e.cannotDm && item.summons_id && item.invite_id) {
+            this.markUnreachable(item.summons_id, item.invite_id, (JSON.parse(item.payload) as DmPayload).to);
+          }
         } else {
           const retryAt = Date.now() + 30_000 * 2 ** (attempts - 1);
           this.sql.exec("UPDATE outbox SET attempts = ?, due_at = ?, last_error = ? WHERE id = ?", attempts, retryAt, errorText(e), item.id);
@@ -774,10 +1207,30 @@ export class Bureau extends DurableObject<Env> {
     return budget;
   }
 
-  private async deliverDm(p: DmPayload, spend: () => void): Promise<void> {
+  /**
+   * The bot can't DM this recipient any more (blocked, left the server, or closed DMs).
+   * Respect that: stop the notices, and tell the issuer once so they can sort it out in person.
+   */
+  private markUnreachable(summonsId: string, inviteId: string, userId: string) {
+    const invite = this.loadInvites(summonsId).find((i) => i.id === inviteId);
+    const summons = this.loadSummons(summonsId);
+    if (!invite || !summons || invite.recipient.id !== userId) return;
+    const already = this.sql.exec("SELECT 1 FROM log WHERE invite_id = ? AND kind = 'unreachable'", inviteId).toArray().length > 0;
+    this.sql.exec("UPDATE invites SET next_nudge_at = NULL WHERE id = ?", inviteId);
+    if (already) return;
+    this.log(summonsId, inviteId, "unreachable", `The Bureau can't reach ${invite.recipient.name} any more; notices stopped`);
+    if (summons.organizer.id === userId) return;
+    this.enqueueDm(summonsId, null, {
+      to: summons.organizer.id,
+      message: renderUnreachable(summons, invite),
+    });
+  }
+
+  private async deliverDm(p: DmPayload, summonsId: string | null, spend: () => void): Promise<void> {
     try {
-      const channel = await this.api.openDm(p.to);
-      await this.send(channel.id, p.message);
+      const channelId = await this.dmChannel(p.to);
+      const sent = await this.send(channelId, p.message);
+      this.trackBotMessage(sent.id, p.to, p.peer ?? null, summonsId, Date.now());
     } catch (e) {
       if (e instanceof DiscordError && e.cannotDm && p.fallbackChannelId) {
         spend();
@@ -790,6 +1243,7 @@ export class Bureau extends DurableObject<Env> {
 
   private async syncMessages(now: number, budget: number): Promise<void> {
     const due = this.sql.exec("SELECT id FROM summons WHERE sync_at IS NOT NULL AND sync_at <= ?", now).toArray();
+    const relay = this.relayEnabled();
     for (const r of due) {
       const id = s(r.id);
       const summons = this.loadSummons(id)!;
@@ -798,9 +1252,22 @@ export class Bureau extends DurableObject<Env> {
         .exec("SELECT * FROM invites WHERE summons_id = ? AND dirty = 1", id)
         .toArray()
         .map(toInvite);
+
+      // /summon messages can only be edited through a live interaction token.
+      for (const invite of dirty.filter((i) => i.deliveredVia === "interaction")) {
+        const token = this.chatToken(id, now, 0);
+        if (token) {
+          this.enqueue("edit_original", id, invite.id, {
+            token: token.token,
+            message: renderSummons(summons, invites, [invite], this.bureau, now),
+          } satisfies WebhookPayload, now);
+        }
+        this.sql.exec("UPDATE invites SET dirty = 0 WHERE id = ?", invite.id);
+      }
+
       const groups = new Map<string, Invite[]>();
       for (const invite of dirty) {
-        if (!invite.channelId || !invite.messageId) continue;
+        if (invite.deliveredVia === "interaction" || !invite.channelId || !invite.messageId) continue;
         const key = `${invite.channelId}/${invite.messageId}`;
         if (!groups.has(key)) groups.set(key, invites.filter((i) => i.messageId === invite.messageId));
       }
@@ -813,7 +1280,7 @@ export class Bureau extends DurableObject<Env> {
         budget--;
         const [channelId, messageId] = key.split("/") as [string, string];
         try {
-          await this.edit(channelId, messageId, renderSummons(summons, invites, addressees, this.bureau, now));
+          await this.edit(channelId, messageId, renderSummons(summons, invites, addressees, this.bureau, now, { relay }));
         } catch (e) {
           if (e instanceof DiscordError && e.code === ERR_UNKNOWN_MESSAGE) {
             this.sql.exec("UPDATE invites SET message_id = NULL WHERE message_id = ?", messageId);

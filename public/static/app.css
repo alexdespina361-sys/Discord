@@ -448,6 +448,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--focus); outline:
 .check--ok { opacity: 0.85; }
 .check--todo { border-left: 4px solid var(--yellow); }
 .check--error { border-left: 4px solid var(--red); }
+.check--info { border-left: 4px solid var(--blue); }
 .check__actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .copy { display: flex; gap: 8px; margin-bottom: 10px; }
 .copy input { font-family: var(--mono); font-size: 0.85rem; min-height: 38px; padding: 6px 10px; }

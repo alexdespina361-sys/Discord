@@ -21,6 +21,7 @@ export async function startStack({ fakePort = 8790, workerPort = 8787, tmpName =
       `DISCORD_CLIENT_SECRET=${fake.state.clientSecret}`,
       `DISCORD_API_BASE=http://127.0.0.1:${fakePort}/api/v10`,
       `DISCORD_WEB_BASE=http://127.0.0.1:${fakePort}`,
+      `DISCORD_GATEWAY_URL=ws://127.0.0.1:${fakePort}`,
       "DEV_MODE=1",
     ].join("\n"),
   );

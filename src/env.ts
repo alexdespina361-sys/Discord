@@ -1,7 +1,9 @@
 import type { Bureau } from "./bureau";
+import type { Gateway } from "./gateway";
 
 export interface Env {
   BUREAU: DurableObjectNamespace<Bureau>;
+  GATEWAY: DurableObjectNamespace<Gateway>;
   ASSETS: Fetcher;
 
   // Set these four as secrets in the Cloudflare dashboard.
@@ -19,6 +21,7 @@ export interface Env {
   // Test/dev only.
   DISCORD_API_BASE?: string;
   DISCORD_WEB_BASE?: string;
+  DISCORD_GATEWAY_URL?: string;
   DEV_MODE?: string;
 }
 
@@ -34,6 +37,10 @@ export function apiBase(env: Env): string {
 
 export function webBase(env: Env): string {
   return (env.DISCORD_WEB_BASE || "https://discord.com").replace(/\/+$/, "");
+}
+
+export function gatewayBase(env: Env): string {
+  return (env.DISCORD_GATEWAY_URL || "wss://gateway.discord.gg").replace(/\/+$/, "");
 }
 
 export function isDevMode(env: Env): boolean {

@@ -382,6 +382,7 @@ const LOG_ICONS: Record<string, string> = {
   verdict: "⚖️",
   nudge: "📮",
   manual_nudge: "🔔",
+  unreachable: "📪",
   reminder: "⏰",
   cancelled: "🗂️",
   closed: "📁",
@@ -398,7 +399,7 @@ function timeline(log: LogEntry[]): SafeHtml {
 }
 
 function rosterRow(s: Summons, i: Invite): SafeHtml {
-  const via = { dm: "📬 DM", channel: "📢 Channel", failed: "⚠️ Not delivered", pending: "…" }[i.deliveredVia];
+  const via = { dm: "📬 DM", channel: "📢 Channel", interaction: "💬 In your chat (/summon)", failed: "⚠️ Not delivered", pending: "…" }[i.deliveredVia];
   return html`<li class="roster__row">
     ${avatar(i.recipient)}
     <div class="roster__who">
@@ -501,7 +502,7 @@ export function dossierPage(c: Ctx & { session: Session }, d: SummonsDossier): R
 
 // --- setup ---------------------------------------------------------------------------
 
-const STATE_ICON = { ok: "✅", todo: "⬜", error: "❌", skip: "➖" } as const;
+const STATE_ICON = { ok: "✅", todo: "⬜", error: "❌", skip: "➖", info: "ℹ️" } as const;
 
 export function setupPage(c: Ctx, report: SetupReport): Response {
   const done = report.checks.filter((x) => x.state === "ok").length;

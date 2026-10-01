@@ -35,6 +35,17 @@ export interface DiscordMessage {
   channel_id: string;
 }
 
+/** A message as Discord sends it in history listings and Gateway events (only the fields we read). */
+export interface DiscordFullMessage extends DiscordMessage {
+  type?: number;
+  guild_id?: string;
+  author?: DiscordUser;
+  content?: string;
+  attachments?: { url: string; filename: string }[];
+  sticker_items?: { name: string }[];
+  message_reference?: { message_id?: string };
+}
+
 export interface DiscordApplication {
   id: string;
   name: string;
@@ -47,6 +58,17 @@ export interface DiscordApplication {
   team?: { owner_user_id?: string; members?: { user: DiscordUser }[] } | null;
   bot_public?: boolean;
   bot?: DiscordUser;
+  /** Keys are the install contexts the app supports: "0" = servers, "1" = user accounts. */
+  integration_types_config?: Record<string, { oauth2_install_params?: { scopes: string[]; permissions: string } }>;
+}
+
+export interface DiscordCommandOption {
+  type: number;
+  name: string;
+  description: string;
+  required?: boolean;
+  max_length?: number;
+  choices?: { name: string; value: string }[];
 }
 
 export interface DiscordCommand {
@@ -56,6 +78,7 @@ export interface DiscordCommand {
   type?: number;
   integration_types?: number[];
   contexts?: number[];
+  options?: DiscordCommandOption[];
 }
 
 export const CHANNEL_TYPE_GUILD_TEXT = 0;
@@ -113,14 +136,19 @@ export class DiscordApi {
     return new DiscordApi(apiBase(env), `Bearer ${accessToken}`);
   }
 
+  /** Interaction webhooks are authorized by the token in their URL. */
+  static webhooks(env: Env): DiscordApi {
+    return new DiscordApi(apiBase(env), "");
+  }
+
   async request<T>(method: string, path: string, body?: unknown, opts: RequestOptions = {}): Promise<T> {
     const url = new URL(this.base + path);
     for (const [k, v] of Object.entries(opts.query ?? {})) if (v !== undefined) url.searchParams.set(k, String(v));
     const headers: Record<string, string> = {
-      authorization: this.authorization,
       "user-agent": "DiscordBot (https://github.com/alexdespina361-sys/Discord, 1.0)",
       ...opts.headers,
     };
+    if (this.authorization) headers.authorization = this.authorization;
     let payload: string | undefined;
     if (opts.form) {
       headers["content-type"] = "application/x-www-form-urlencoded";
@@ -209,6 +237,25 @@ export class DiscordApi {
     return this.sendMessage(channel.id, message);
   }
 
+  /** Messages after `after` (oldest first is not guaranteed; callers sort). */
+  channelMessages(channelId: string, after: string, limit = 20) {
+    return this.request<DiscordFullMessage[]>("GET", `/channels/${channelId}/messages`, undefined, { query: { after, limit } });
+  }
+
+  addReaction(channelId: string, messageId: string, emoji: string) {
+    return this.request<void>("PUT", `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`);
+  }
+
+  // --- interaction webhooks (valid for 15 minutes after the interaction) -------------
+
+  followup(applicationId: string, token: string, message: object) {
+    return this.request<DiscordMessage>("POST", `/webhooks/${applicationId}/${token}`, message);
+  }
+
+  editOriginal(applicationId: string, token: string, message: object) {
+    return this.request<DiscordMessage>("PATCH", `/webhooks/${applicationId}/${token}/messages/@original`, message);
+  }
+
   // --- scheduled events -----------------------------------------------------
 
   createScheduledEvent(guildId: string, body: object) {
@@ -225,7 +272,7 @@ export class DiscordApi {
     return this.request<DiscordApplication>("GET", "/applications/@me");
   }
 
-  editApplication(body: Partial<Pick<DiscordApplication, "interactions_endpoint_url" | "flags">>) {
+  editApplication(body: Partial<Pick<DiscordApplication, "interactions_endpoint_url" | "flags" | "integration_types_config">>) {
     return this.request<DiscordApplication>("PATCH", "/applications/@me", body);
   }
 
@@ -271,6 +318,15 @@ export function inviteUrl(env: Env, guildId?: string): string {
   u.searchParams.set("permissions", BOT_PERMISSIONS);
   u.searchParams.set("integration_type", "0");
   if (guildId) u.searchParams.set("guild_id", guildId);
+  return u.toString();
+}
+
+/** Lets someone add the app to their own Discord account, so /summon works in their DMs. */
+export function userInstallUrl(env: Env): string {
+  const u = new URL(webBase(env) + "/oauth2/authorize");
+  u.searchParams.set("client_id", cfg(env, "DISCORD_APPLICATION_ID"));
+  u.searchParams.set("integration_type", "1");
+  u.searchParams.set("scope", "applications.commands");
   return u.toString();
 }
 
