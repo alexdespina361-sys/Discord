@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Keep this name in sync with the Worker name in the Cloudflare dashboard.
+  "name": "summons-bureau",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "BUREAU", "class_name": "Bureau" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Bureau"] }],
+  "observability": { "enabled": true },
+  // Discord credentials are set as secrets in the Cloudflare dashboard;
+  // never let a deploy wipe variables that were added there.
+  "keep_vars": true
+}

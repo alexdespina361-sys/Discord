@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Seal of the Bureau of Mandatory Attendance">
+  <defs>
+    <path id="top" d="M50.1,173 A90,90 0 1,1 205.9,173"/>
+    <path id="bottom" d="M57.3,198.7 A100,100 0 0,0 198.7,198.7"/>
+    <radialGradient id="face" cx="50%" cy="40%" r="65%">
+      <stop offset="0%" stop-color="#2c4470"/>
+      <stop offset="100%" stop-color="#16233a"/>
+    </radialGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ecd38c"/>
+      <stop offset="100%" stop-color="#b08d3c"/>
+    </linearGradient>
+  </defs>
+  <circle cx="128" cy="128" r="124" fill="url(#gold)"/>
+  <circle cx="128" cy="128" r="117" fill="url(#face)"/>
+  <circle cx="128" cy="128" r="111" fill="none" stroke="url(#gold)" stroke-width="2"/>
+  <circle cx="128" cy="128" r="76" fill="none" stroke="url(#gold)" stroke-width="2"/>
+  <circle cx="128" cy="128" r="70" fill="none" stroke="url(#gold)" stroke-width="1" stroke-dasharray="2 4"/>
+  <g font-family="Georgia, 'DejaVu Serif', 'Times New Roman', serif" font-weight="700" fill="url(#gold)">
+    <text font-size="14.5" letter-spacing="1.3">
+      <textPath href="#top" startOffset="50%" text-anchor="middle">BUREAU OF MANDATORY ATTENDANCE</textPath>
+    </text>
+    <text font-size="12" letter-spacing="2">
+      <textPath href="#bottom" startOffset="50%" text-anchor="middle">★ EST. 2026 ★</textPath>
+    </text>
+    <path d="M128 64 l9.4 19.1 21.1 3.1-15.3 14.9 3.6 21-18.8-9.9-18.8 9.9 3.6-21-15.3-14.9 21.1-3.1z"/>
+    <text x="128" y="158" font-size="36" letter-spacing="3" text-anchor="middle">BMA</text>
+    <text x="128" y="182" font-size="10" letter-spacing="2.5" text-anchor="middle">FORM 27</text>
+  </g>
+  <path d="M86 167 h84" stroke="url(#gold)" stroke-width="1.5"/>
+</svg>
