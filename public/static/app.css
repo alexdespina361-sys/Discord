@@ -463,6 +463,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--focus); outline:
 .copy-dialog__card h2 { font-size: 1.1rem; }
 .copy-dialog textarea { font-family: var(--mono); font-size: 0.85rem; min-height: 220px; }
 .copy-dialog__actions { display: flex; justify-content: flex-end; margin-top: 12px; }
+.summon-ready__steps { margin: 10px 0 6px; padding-left: 1.3em; }
+.summon-ready__steps li { margin: 6px 0; }
+.summon-ready__actions { display: grid; gap: 8px; margin-top: 14px; }
 
 /* --- toast ------------------------------------------------------------------------------- */
 .toast {

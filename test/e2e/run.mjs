@@ -663,6 +663,7 @@ await step("setup: one tap allows /summon in personal DMs and re-registers the c
 });
 
 const andrei = { id: IDS.alice, username: "andrei", global_name: "Andrei", avatar: null };
+const bogdan = { id: IDS.bob, username: "bogdan", global_name: "Bogdan", avatar: null };
 const slash = (from, options, extra = {}) =>
   interact({
     type: 2,
@@ -673,7 +674,7 @@ const slash = (from, options, extra = {}) =>
       name: "summon",
       type: 1,
       options: Object.entries(options).map(([name, value]) => ({ name, value, type: name === "who" ? 6 : 3 })),
-      resolved: { users: { [IDS.alice]: andrei } },
+      resolved: { users: { [IDS.alice]: andrei, [IDS.bob]: bogdan } },
     },
     ...extra,
   });
@@ -800,6 +801,102 @@ await step("when someone blocks the bot, notices stop and the issuer is told", a
   } finally {
     fake.state.dmClosed.delete(IDS.alice);
   }
+});
+
+// --- designed on the website, posted with /summon ------------------------------------------------
+
+const design = {
+  ...baseDraft,
+  title: "Operation Website",
+  options: [
+    { kind: "yes", label: "On my way", emoji: "🚀" },
+    { kind: "no", label: "Not today", emoji: "😴" },
+  ],
+  startsAt: Date.now() + 2 * 3_600_000,
+  createScheduledEvent: false,
+};
+const otherDm = "1400000000000000098"; // the organizer's DM with Bogdan
+
+await step("website: 'Post it with /summon' saves a design for exactly one person", async () => {
+  assert.match(await (await web("/new")).text(), /Post it with \/summon/);
+  let r = await api("/api/summons/prepare", { ...design, recipients: [IDS.alice, IDS.bob] });
+  assert.equal(r.status, 400);
+  assert.equal(r.json.field, "recipients");
+  r = await api("/api/summons/prepare", { ...design, recipients: [IDS.alice] });
+  assert.equal(r.json.ok, true, r.json.error);
+  assert.equal(r.json.name, "Andrei");
+  assert.match(r.json.userInstallUrl, /integration_type=1/);
+});
+
+await step("/summon with nothing filled in posts that design right in the chat", async () => {
+  const r = await slash(IDS.organizer, {});
+  assert.equal(r.json.type, 4, JSON.stringify(r.json));
+  assertValidMessage(r.json.data, "prepared /summon");
+  assert.match(r.json.data.content, new RegExp(`<@${IDS.alice}>`));
+  assert.match(text(r.json.data), /Operation Website/);
+  const buttons = r.json.data.components[0].components;
+  assert.deepEqual(buttons.map((b) => b.label), ["On my way", "Not today"]);
+  assert.ok(r.json.data.components[1].components[0].custom_id.startsWith("n:"), "🔔 row");
+  const id = buttons[0].custom_id.split(":")[1];
+  assert.ok(messages().find((m) => m.channel_id === IDS.personalDm && m.components?.[0]?.components?.[0]?.custom_id === `r:${id}:yes`));
+  const answered = await click(IDS.alice, messages().find((m) => m.components?.[0]?.components?.[0]?.custom_id === `r:${id}:yes`), `r:${id}:yes`);
+  assert.match(text(answered.json.data), /ACCEPTED/);
+});
+
+await step("a design is posted once: the next /summon says nothing is waiting", async () => {
+  const r = await slash(IDS.organizer, {});
+  assert.equal(r.json.type, 4);
+  assert.ok(r.json.data.flags & 64, "only the issuer sees it");
+  assert.match(r.json.data.content, /no summons waiting/);
+  assert.match(r.json.data.components[0].components[0].url, /\/new$/);
+});
+
+await step("'who' sends the design to someone else; with nothing saved it posts a generic summons", async () => {
+  await api("/api/summons/prepare", { ...design, title: "Operation Redirect", recipients: [IDS.alice] });
+  let r = await slash(IDS.organizer, { who: IDS.bob }, { channel_id: otherDm });
+  assert.equal(r.json.type, 4);
+  assert.match(r.json.data.content, new RegExp(`<@${IDS.bob}>`));
+  assert.match(text(r.json.data), /Operation Redirect/);
+  r = await slash(IDS.organizer, { who: IDS.alice });
+  assert.equal(r.json.type, 4);
+  assert.ok(!((r.json.data.flags ?? 0) & 64));
+  assert.match(text(r.json.data), /Unspecified Operation/);
+});
+
+await step("when Discord says who's in the DM, the design goes to them", async () => {
+  await api("/api/summons/prepare", { ...design, title: "Operation Partner", recipients: [IDS.alice] });
+  const r = await slash(IDS.organizer, {}, { channel_id: otherDm, channel: { id: otherDm, type: 1, recipients: [bogdan] } });
+  assert.equal(r.json.type, 4);
+  assert.match(r.json.data.content, new RegExp(`<@${IDS.bob}>`));
+  assert.match(text(r.json.data), /Operation Partner/);
+});
+
+await step("in the bot's own DM, /summon with nothing filled in has the bot DM the design", async () => {
+  await api("/api/summons/prepare", { ...design, title: "Operation Courier", recipients: [IDS.alice] });
+  const r = await interact({
+    type: 2,
+    context: 1,
+    channel_id: fake.dmChannelFor(IDS.organizer),
+    user: user(IDS.organizer),
+    data: { name: "summon", type: 1 },
+  });
+  assert.equal(r.json.type, 5);
+  await waitFor("the deferred reply is filled in", () => {
+    const hook = fake.state.webhooks.get(r.token);
+    return fake.state.messages.get(hook?.originalId)?.content?.includes("delivered to **Andrei** by DM");
+  });
+  assert.ok(dmsTo(IDS.alice).some((m) => text(m).includes("Operation Courier")));
+});
+
+await step("the 5-minute job updates commands registered by an older version", async () => {
+  const summon = () => fake.state.commands.find((c) => c.name === "summon");
+  assert.equal(summon().options.find((o) => o.name === "who").required, undefined, "stored like Discord: no required:false");
+  summon().options.find((o) => o.name === "who").required = true; // what the previous version registered
+  assert.match(await (await web("/setup")).text(), /Update them/);
+  const cron = await fetch(`${WORKER}/cdn-cgi/handler/scheduled`);
+  assert.equal(cron.status, 200, await cron.text());
+  await waitFor("commands re-registered", () => !summon().options.find((o) => o.name === "who").required);
+  assert.doesNotMatch(await (await web("/setup")).text(), /Update them/);
 });
 
 console.log(`\nAll ${passed} end-to-end checks passed.`);

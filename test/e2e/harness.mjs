@@ -35,6 +35,7 @@ export async function startStack({ fakePort = 8790, workerPort = 8787, tmpName =
       "--persist-to", `${tmp}/state`,
       "--env-file", `${tmp}/test.env`,
       "--show-interactive-dev-session=false",
+      "--test-scheduled",
       "--log-level", "warn",
     ],
     { cwd: new URL("../..", import.meta.url).pathname, stdio: ["ignore", "pipe", "pipe"], detached: true },

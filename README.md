@@ -12,6 +12,7 @@ Write “come play LoL” or “come to Lidl with me” on a website, and it bec
 - Summon several people at once (each gets a DM with a live roster), or post one public summons in a channel that pings everyone.
 - Optionally adds the summons to the server's **Events** tab too.
 - **`/summon` in your own DM with a friend.** Type `/summon who:@friend what:Gaming` and the summons appears right in that chat. If they don't answer, up to 3 notices follow automatically in the first 15 minutes, and a 🔔 button (issuer only) starts another round.
+- **Design it on the website, post it with `/summon`.** Make the summons on the website with every detail you want and press *Post it with /summon*. Then send `/summon` with nothing filled in, in your DM with that friend, and the bot posts your summons right there, with its buttons.
 - **Replies are forwarded.** Whatever your friend types to the bot is passed on to whoever last sent them something through the Bureau (usually whoever summoned them). Reply to a forwarded message and your answer goes back. Messages are never forwarded back to the person who wrote them, and the bot says who your messages go to whenever that changes.
 - **Blocks are respected.** If someone blocks the bot (or closes their DMs), notices to them stop and you get one message saying so.
 - **Or send it yourself.** Next to *Dispatch summons* there's *Copy to send it yourself*: it copies the summons as formatted Discord text (mentions and times included) to paste into your DM and send from your own account. The bot sends nothing; your friend answers by reacting with an emoji.
@@ -68,6 +69,8 @@ On the website: press **Issue a summons** and pick a template. Choose your frien
 
 In Discord: open your DM with a friend and type `/summon`. Pick *who*, *what* (gaming, groceries, food…), and optionally *when*, your own *title* and a *note*.
 
+Both at once: design the summons on the website and press **Post it with /summon** instead of *Dispatch*. Then open your DM with that friend and send `/summon` with nothing filled in: the bot posts the summons you designed. It waits up to 24 hours for your `/summon`, and only the latest one you saved counts. Fill in *who* to send that design to someone else instead. In the bot's own DM, `/summon` with nothing filled in has the bot DM it to them instead, just like *Dispatch*.
+
 ---
 
 ## Good to know
@@ -78,6 +81,7 @@ In Discord: open your DM with a friend and type `/summon`. Pick *who*, *what* (g
 - A summons closes when its event ends, and the buttons are disabled.
 - **DM forwarding needs an always-on connection to Discord.** Keeping it open uses roughly 80% of Cloudflare's free daily allowance for always-on objects (Durable Objects). That's fine for one bot. If you ever hit the limit, turn forwarding off on the setup page, or move to Cloudflare's paid Workers plan.
 - `/summon` can only post in a personal DM while Discord's 15-minute window for that command is open. Later notices and reminders come from the bot's own DM.
+- After an update changes the `/summon` command, Discord picks up the new version within 5 minutes by itself. The Discord app may need a restart to show it.
 
 ### Optional settings
 

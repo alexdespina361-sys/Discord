@@ -13,9 +13,9 @@ import {
   SESSION_COOKIE,
   type Session,
 } from "./session";
-import { SETUP_ACTIONS, redirectUrl, runAction, runChecks, type SetupAction } from "./setup";
+import { SETUP_ACTIONS, redirectUrl, runAction, runChecks, syncCommands, type SetupAction } from "./setup";
 import { bureauStub, gatewayStub } from "./stub";
-import { createSummons, directory, jsonError, organizerAction, preview, respondOnWeb, searchMembers, sharedGuilds } from "./web/api";
+import { createSummons, directory, jsonError, organizerAction, prepareSummons, preview, respondOnWeb, searchMembers, sharedGuilds } from "./web/api";
 import { composePage, dashboardPage, dossierPage, landingPage, messagePage, prefillFrom, setupPage } from "./web/pages";
 
 export { Bureau } from "./bureau";
@@ -187,6 +187,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
   if (path === "/api/preview" && isPost) return preview(env, session, await readJson(request), origin);
   if (path === "/api/summons" && isPost) return createSummons(env, session, await readJson(request), origin);
+  if (path === "/api/summons/prepare" && isPost) return prepareSummons(env, session, await readJson(request), origin);
   if ((m = path.match(/^\/api\/summons\/([A-Za-z0-9]{4,32})\/(cancel|nudge|respond)$/)) && isPost) {
     if (m[2] === "respond") return respondOnWeb(env, session, m[1]!, await readJson(request));
     return organizerAction(env, session, m[1]!, m[2] as "cancel" | "nudge");
@@ -215,7 +216,10 @@ export default {
     }
   },
 
-  /** Every 5 minutes: make sure the Gateway connection that hears DMs is up (it also has its own watchdog). */
+  /**
+   * Every 5 minutes: make sure the Gateway connection that hears DMs is up (it also has its own watchdog),
+   * and bring the slash commands up to date after a deploy changed them.
+   */
   async scheduled(_controller, env, ctx): Promise<void> {
     if (missingConfig(env).length) return;
     ctx.waitUntil(
@@ -224,5 +228,6 @@ export default {
         .then(() => undefined)
         .catch((e) => console.error("gateway watchdog failed", e)),
     );
+    ctx.waitUntil(syncCommands(env).catch((e) => console.error("command sync failed", e)));
   },
 } satisfies ExportedHandler<Env>;

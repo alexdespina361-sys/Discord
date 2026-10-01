@@ -364,9 +364,13 @@ export function composePage(
     <div class="dispatch">
       <p class="form-error" id="form-error" role="alert" hidden></p>
       <button type="submit" form="compose" class="btn btn--primary btn--lg btn--block" id="dispatch">📨 Dispatch summons</button>
+      <p class="hint">The bot sends it to them in its own DM.</p>
+      <div class="or"><span>or</span></div>
+      <button type="button" class="btn btn--secondary btn--lg btn--block" id="post-summon">💬 Post it with /summon</button>
+      <p class="hint">For one person. You then send <code>/summon</code> in your own DM with them, and the bot posts this summons right in your chat, with its buttons.</p>
       <div class="or"><span>or</span></div>
       <button type="button" class="btn btn--secondary btn--lg btn--block" id="copy-text">📋 Copy to send it yourself</button>
-      <p class="hint">Copies the summons as text. Paste it in your DM and send it yourself: the bot sends nothing. There are no buttons on your own message, so they answer by reacting with an emoji.</p>
+      <p class="hint">Copies it as text for you to paste and send. The bot sends nothing, so there are no buttons: they answer by reacting with an emoji.</p>
     </div>
   </div>`;
   return page({ ...c, title: "New summons", active: "new", body, scripts: ["/static/compose.js"] });

@@ -7,6 +7,7 @@ import {
   ERR_UNKNOWN_MEMBER,
   avatarUrl,
   displayName,
+  userInstallUrl,
   type DiscordMember,
 } from "../discord";
 import { allowedOrganizers, bureauName, type Env } from "../env";
@@ -21,6 +22,7 @@ import {
   type ResponseKind,
   type ResponseOption,
   type Summons,
+  type SummonsDraft,
 } from "../model";
 import { clip, renderSummons, renderSummonsText } from "../messages";
 import type { Session } from "../session";
@@ -167,12 +169,15 @@ export function preview(env: Env, session: Session, input: Record<string, unknow
   });
 }
 
-export async function createSummons(
-  env: Env,
-  session: Session,
-  input: unknown,
-  origin: string,
-): Promise<Response> {
+interface ResolvedDraft {
+  draft: SummonsDraft;
+  guildName: string;
+  organizer: Person;
+  recipients: Person[];
+}
+
+/** Validates a draft from the compose form and looks up everyone in it on Discord. */
+async function resolveDraft(env: Env, session: Session, input: unknown): Promise<ResolvedDraft | Response> {
   const allowed = allowedOrganizers(env);
   if (allowed && !allowed.has(session.uid)) {
     return jsonError(403, "You're not on the list of officers allowed to issue summonses.");
@@ -209,7 +214,13 @@ export async function createSummons(
     name: organizerMember.user ? displayName(organizerMember.user, organizerMember) : session.name,
     avatar: session.avatar,
   };
+  return { draft, guildName, organizer, recipients };
+}
 
+export async function createSummons(env: Env, session: Session, input: unknown, origin: string): Promise<Response> {
+  const resolved = await resolveDraft(env, session, input);
+  if (resolved instanceof Response) return resolved;
+  const { draft, guildName, organizer, recipients } = resolved;
   try {
     const result = await bureauStub(env).issue(draft, { organizer, guildName, recipients, origin });
     return Response.json({
@@ -223,6 +234,22 @@ export async function createSummons(
     if (message.includes("too many")) return jsonError(429, message);
     throw e;
   }
+}
+
+/** Saves a summons designed on the website for the issuer's next /summon in a DM. */
+export async function prepareSummons(env: Env, session: Session, input: unknown, origin: string): Promise<Response> {
+  const resolved = await resolveDraft(env, session, input);
+  if (resolved instanceof Response) return resolved;
+  if (resolved.recipients.length !== 1) {
+    return jsonError(400, "/summon posts in a DM with one person. Pick just them, or use Dispatch for a group.", "recipients");
+  }
+  await bureauStub(env).prepare(resolved.draft, {
+    organizer: resolved.organizer,
+    guildName: resolved.guildName,
+    recipients: resolved.recipients,
+    origin,
+  });
+  return Response.json({ ok: true, name: resolved.recipients[0]!.name, userInstallUrl: userInstallUrl(env) });
 }
 
 export async function organizerAction(

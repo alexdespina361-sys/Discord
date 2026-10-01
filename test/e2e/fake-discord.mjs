@@ -391,7 +391,12 @@ export function createFakeDiscord({ publicKeyHex, privateKey }) {
             for (const ch of o.choices ?? []) if (ch.name.length > 100 || ch.value.length > 100) return invalid(res, [`bad choice ${ch.name}`]);
           }
         }
-        state.commands = body.map((c) => ({ ...c, id: nextId() }));
+        // Like Discord, don't echo back options' required:false.
+        state.commands = body.map((c) => ({
+          ...c,
+          id: nextId(),
+          options: c.options?.map(({ required, ...o }) => (required ? { ...o, required } : o)),
+        }));
       }
       return send(res, 200, state.commands);
     }

@@ -60,14 +60,63 @@ export function commandDefinitions(userInstall: boolean): DiscordCommand[] {
       integration_types,
       contexts,
       options: [
-        { type: 6, name: "who", description: "Who is being summoned", required: true },
-        { type: 3, name: "what", description: "What it's about", required: true, choices: WHAT_CHOICES },
+        { type: 6, name: "who", description: "Who to summon (leave empty for whoever you picked on the website)", required: false },
+        { type: 3, name: "what", description: "What it's about (leave empty to post the one you prepared on the website)", required: false, choices: WHAT_CHOICES },
         { type: 3, name: "when", description: "When it starts (default: right now)", required: false, choices: WHEN_CHOICES },
         { type: 3, name: "title", description: "Your own title, e.g. Operation Pizza", required: false, max_length: 100 },
         { type: 3, name: "note", description: "Extra details for the objective", required: false, max_length: 300 },
       ],
     },
   ];
+}
+
+/** The parts of a command Discord stores that we care about, in a stable shape for comparing. */
+function commandShape(c: DiscordCommand) {
+  return {
+    name: c.name,
+    description: c.description,
+    integration_types: [...(c.integration_types ?? [0])].sort(),
+    contexts: [...(c.contexts ?? [])].sort(),
+    options: (c.options ?? []).map((o) => ({
+      type: o.type,
+      name: o.name,
+      description: o.description,
+      required: Boolean(o.required),
+      max_length: o.max_length ?? null,
+      choices: (o.choices ?? []).map((ch) => `${ch.name}=${ch.value}`),
+    })),
+  };
+}
+
+/** Whether what's registered on Discord matches what this version of the code expects. */
+export function commandsMatch(registered: DiscordCommand[], wanted: DiscordCommand[]): boolean {
+  return wanted.every((w) => {
+    const r = registered.find((c) => c.name === w.name);
+    return r !== undefined && JSON.stringify(commandShape(r)) === JSON.stringify(commandShape(w));
+  });
+}
+
+/** Changes whenever the command definitions in the code change (i.e. after a deploy that touched them). */
+export async function commandsDigest(): Promise<string> {
+  const data = new TextEncoder().encode(JSON.stringify([commandDefinitions(false), commandDefinitions(true)]));
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+  return [...hash].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * After a deploy changes the commands, re-register them so people don't have to tap "Update" on the setup page.
+ * Only touches commands someone already registered.
+ */
+export async function syncCommands(env: Env): Promise<void> {
+  const bureau = bureauStub(env);
+  const digest = await commandsDigest();
+  if ((await bureau.commandsDigest()) === digest) return;
+  const api = DiscordApi.bot(env);
+  const app = await api.application();
+  const registered = await api.commands(app.id);
+  const wanted = commandDefinitions(userInstallEnabled(app));
+  if (registered.length && !commandsMatch(registered, wanted)) await api.putCommands(app.id, wanted);
+  await bureau.setCommandsDigest(digest);
 }
 
 export function userInstallEnabled(app: DiscordApplication): boolean {
@@ -242,8 +291,7 @@ export async function runChecks(env: Env, origin: string, session: Session | nul
   try {
     const commands = await api.commands(app.id);
     const summon = commands.find((c) => c.name === "summon");
-    const current =
-      commands.some((c) => c.name === "bureau") && summon && (!userInstall || (summon.integration_types ?? []).includes(1));
+    const current = commandsMatch(commands, commandDefinitions(userInstall));
     checks.push(
       current
         ? { id: "commands", label: "/summon and /bureau commands registered", state: "ok" }
@@ -251,7 +299,7 @@ export async function runChecks(env: Env, origin: string, session: Session | nul
             id: "commands",
             label: "/summon and /bureau commands registered",
             state: "todo",
-            detail: summon ? "Update them so they also work in personal DMs." : "Lets people summon someone straight from Discord.",
+            detail: summon ? "They're from an older version of the Bureau. Update them." : "Lets people summon someone straight from Discord.",
             action: { id: "commands", label: summon ? "Update them" : "Register them" },
           },
     );

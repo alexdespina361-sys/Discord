@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { validateMessage } from "../e2e/fake-discord.mjs";
 import { WHAT_CHOICES, WHEN_CHOICES, quickDraft } from "../../src/quick";
-import { commandDefinitions } from "../../src/setup";
+import { commandDefinitions, commandsMatch } from "../../src/setup";
 import { renderInChatCancel, renderInChatResponse, renderInChatVerdict, renderNudge, renderSummons } from "../../src/messages";
 import { DEFAULT_OPTIONS, type Invite, type InviteStatus, type Summons } from "../../src/model";
 import { TEMPLATES } from "../../src/templates";
@@ -58,6 +58,36 @@ describe("command definitions", () => {
   it("only reach personal DMs once user installs are enabled", () => {
     expect(commandDefinitions(false)[1]).toMatchObject({ name: "summon", integration_types: [0], contexts: [0, 1] });
     expect(commandDefinitions(true)[1]).toMatchObject({ name: "summon", integration_types: [0, 1], contexts: [0, 1, 2] });
+  });
+
+  it("need nothing filled in, so /summon alone can post the summons prepared on the website", () => {
+    expect(commandDefinitions(true)[1]!.options?.filter((o) => o.required)).toEqual([]);
+  });
+});
+
+describe("commandsMatch", () => {
+  const wanted = commandDefinitions(true);
+  // What Discord hands back: extra fields, no required:false, arrays in any order.
+  const stored = () =>
+    wanted.map((c) => ({
+      ...c,
+      id: "1",
+      version: "2",
+      name_localizations: null,
+      contexts: [...(c.contexts ?? [])].reverse(),
+      options: c.options?.map(({ required, ...o }) => (required ? { ...o, required } : o)),
+    }));
+
+  it("ignores how Discord stores the commands", () => {
+    expect(commandsMatch(stored(), wanted)).toBe(true);
+  });
+
+  it("spots commands from an older version", () => {
+    const old = stored();
+    old[1]!.options![0]!.required = true;
+    expect(commandsMatch(old, wanted)).toBe(false);
+    expect(commandsMatch(stored().slice(0, 1), wanted)).toBe(false);
+    expect(commandsMatch(stored(), commandDefinitions(false))).toBe(false);
   });
 });
 

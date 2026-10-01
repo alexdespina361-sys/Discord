@@ -416,6 +416,62 @@ form.addEventListener("submit", async (e) => {
 
 for (const id of ["title", "startsAt", "classification"]) $(id).addEventListener("input", () => clearError(id));
 
+// --- post it with /summon -----------------------------------------------------------------------
+
+function showSummonReady(name, installUrl) {
+  const close = () => overlay.remove();
+  const overlay = el(
+    "div",
+    { class: "copy-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Ready for /summon" },
+    el(
+      "div",
+      { class: "card copy-dialog__card summon-ready" },
+      el("h2", {}, "✅ Saved. Now post it from Discord"),
+      el(
+        "ol",
+        { class: "summon-ready__steps" },
+        el("li", {}, "Open your DM with ", el("strong", {}, name), "."),
+        el("li", {}, "Type ", el("code", {}, "/summon"), ", tap it, leave everything empty and send."),
+      ),
+      el("p", { class: "hint" }, "The bot posts this summons right in your chat, with its buttons. It waits for your /summon for 24 hours."),
+      el(
+        "div",
+        { class: "summon-ready__actions" },
+        el("a", { class: "btn btn--discord btn--block", href: "https://discord.com/channels/@me" }, "Open Discord"),
+        el("a", { class: "btn btn--secondary btn--block", href: installUrl, target: "_blank", rel: "noopener" }, "➕ Add the bot to my account"),
+      ),
+      el("p", { class: "hint" }, "First time only: add the bot to your account, or /summon won't show up in your DMs."),
+      el("div", { class: "copy-dialog__actions" }, el("button", { type: "button", class: "btn btn--ghost", onclick: close }, "Close")),
+    ),
+  );
+  overlay.addEventListener("click", (e) => e.target === overlay && close());
+  document.body.append(overlay);
+}
+
+$("post-summon").addEventListener("click", async () => {
+  clearErrors();
+  const draft = collect();
+  if (draft.recipients.length !== 1) {
+    return showError("recipients", draft.recipients.length ? "/summon posts in a DM with one person. Pick just them." : "Pick the person to summon.");
+  }
+  if (!draft.title.trim()) return showError("title", "Give the summons a title.");
+  if (!draft.startsAt) return showError("startsAt", "When is it happening?");
+
+  const button = $("post-summon");
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "💬 Saving…";
+  try {
+    const result = await postJson("/api/summons/prepare", { ...draft, delivery: "dm" });
+    showSummonReady(result.name, result.userInstallUrl);
+  } catch (err) {
+    showError(err.field, err.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+});
+
 // --- copy instead of dispatching ----------------------------------------------------------------
 
 $("copy-text").addEventListener("click", async () => {

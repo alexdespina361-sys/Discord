@@ -90,6 +90,18 @@ export type BellResult =
 
 export type OrganizerActionResult = { ok: true; count: number } | { ok: false; reason: string };
 
+/** Where /summon wants a prepared summons: posted in the chat it was used in, or sent by the bot's DM. */
+export type PreparedTarget =
+  | { kind: "here"; channelId: string; guildId: string | null; token: string; recipient: Person | null }
+  | { kind: "dm"; recipient: Person | null };
+
+export type PreparedResult =
+  | { ok: true; summons: Summons; invites: Invite[]; deliveries: DeliveryResult[] }
+  | { ok: false; reason: "none" | "past" | "limit"; message?: string };
+
+/** How long a summons prepared on the website waits for /summon. */
+const PREPARED_TTL_MS = 24 * 3_600_000;
+
 export interface DashboardData {
   issued: SummonsBundle[];
   received: SummonsBundle[];
@@ -356,6 +368,12 @@ export class Bureau extends DurableObject<Env> {
         // Earlier versions could pair someone with themselves (a self-summons); that only echoed messages back.
         this.sql.exec("DELETE FROM relay_partners WHERE partner_id = user_id");
       },
+      () => {
+        // A summons designed on the website, waiting for its issuer's next /summon in a DM.
+        this.sql.exec(
+          "CREATE TABLE IF NOT EXISTS prepared (user_id TEXT PRIMARY KEY, data TEXT NOT NULL, created_at INTEGER NOT NULL)",
+        );
+      },
     ];
     const version = Number(this.getSetting("schema_version") ?? 0);
     if (version >= steps.length) return;
@@ -393,6 +411,14 @@ export class Bureau extends DurableObject<Env> {
 
   relayEnabled(): boolean {
     return this.getSetting("relay") !== "0";
+  }
+
+  commandsDigest(): string | null {
+    return this.getSetting("commands_digest");
+  }
+
+  setCommandsDigest(digest: string): void {
+    this.setSettingSync("commands_digest", digest);
   }
 
   setRelay(enabled: boolean): boolean {
@@ -601,6 +627,52 @@ export class Bureau extends DurableObject<Env> {
     this.log(id, null, "delivered", "Posted in the chat where /summon was used");
     await this.reschedule();
     return this.loadBundle(id)!;
+  }
+
+  /** Keeps a summons designed on the website until its issuer types /summon in a DM (one per person; newest wins). */
+  prepare(draft: SummonsDraft, context: IssueContext): void {
+    this.sql.exec(
+      `INSERT INTO prepared (user_id, data, created_at) VALUES (?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, created_at = excluded.created_at`,
+      context.organizer.id, JSON.stringify({ draft, context }), Date.now(),
+    );
+  }
+
+  /** /summon with nothing filled in: issue the summons this person prepared on the website. */
+  async issuePrepared(userId: string, target: PreparedTarget): Promise<PreparedResult> {
+    const now = Date.now();
+    const row = this.sql.exec("SELECT data FROM prepared WHERE user_id = ? AND created_at > ?", userId, now - PREPARED_TTL_MS).toArray()[0];
+    if (!row) return { ok: false, reason: "none" };
+    const prepared = JSON.parse(s(row.data)) as { draft: SummonsDraft; context: IssueContext };
+    if (endsAt(prepared.draft) <= now) {
+      this.sql.exec("DELETE FROM prepared WHERE user_id = ?", userId);
+      return { ok: false, reason: "past" };
+    }
+    const recipients = target.recipient ? [target.recipient] : prepared.context.recipients;
+    const draft: SummonsDraft = {
+      ...prepared.draft,
+      recipients: recipients.map((r) => r.id),
+      // A deadline that passed while it waited would only show up as overdue.
+      respondBy: prepared.draft.respondBy && prepared.draft.respondBy > now ? prepared.draft.respondBy : null,
+    };
+    const context = { ...prepared.context, recipients };
+    try {
+      let result: { summons: Summons; invites: Invite[]; deliveries: DeliveryResult[] };
+      if (target.kind === "here") {
+        const bundle = await this.issueHere(
+          { ...draft, guildId: target.guildId ?? "", createScheduledEvent: false },
+          { ...context, guildName: "", channelId: target.channelId, guildId: target.guildId, token: target.token },
+        );
+        result = { ...bundle, deliveries: bundle.invites.map((i) => ({ recipient: i.recipient, deliveredVia: i.deliveredVia, error: null })) };
+      } else {
+        // The same as tapping Dispatch on the website.
+        result = await this.issue({ ...draft, delivery: "dm" }, context);
+      }
+      this.sql.exec("DELETE FROM prepared WHERE user_id = ?", userId);
+      return { ok: true, ...result };
+    } catch (e) {
+      return { ok: false, reason: "limit", message: errorText(e) };
+    }
   }
 
   private markDelivered(invite: Invite, via: "dm" | "channel", channelId: string, messageId: string) {
@@ -1063,6 +1135,7 @@ export class Bureau extends DurableObject<Env> {
     if (now - Number(this.getSetting("pruned_at") ?? 0) < 3_600_000) return;
     this.sql.exec("DELETE FROM relay_seen WHERE at < ?", now - 3 * 86_400_000);
     this.sql.exec("DELETE FROM bot_messages WHERE at < ?", now - 60 * 86_400_000);
+    this.sql.exec("DELETE FROM prepared WHERE created_at < ?", now - PREPARED_TTL_MS);
     this.setSettingSync("pruned_at", String(now));
   }
 
