@@ -30,6 +30,7 @@ import {
   renderNudge,
   renderRelayFailed,
   renderRelayHelp,
+  renderRelayRouted,
   renderReminder,
   renderUnreachable,
   renderResponseNotice,
@@ -348,6 +349,12 @@ export class Bureau extends DurableObject<Env> {
         this.addColumn("summons", "interaction_followups", "INTEGER NOT NULL DEFAULT 0");
         this.addColumn("invites", "window_nudges", "INTEGER NOT NULL DEFAULT 0");
         this.sql.exec(SCHEMA_V2_TABLES);
+      },
+      () => {
+        // Where each person's typed messages went last, so we can say so when it changes.
+        this.addColumn("dm_channels", "last_target", "TEXT");
+        // Earlier versions could pair someone with themselves (a self-summons); that only echoed messages back.
+        this.sql.exec("DELETE FROM relay_partners WHERE partner_id = user_id");
       },
     ];
     const version = Number(this.getSetting("schema_version") ?? 0);
@@ -893,6 +900,12 @@ export class Bureau extends DurableObject<Env> {
       this.notePartner(m.author.id, route.to, route.summonsId, now);
       this.notePartner(route.to, m.author.id, route.summonsId, now);
       await this.api.addReaction(m.channelId, m.id, "📨").catch(() => undefined);
+      // Say who's getting their messages whenever that changes, so nothing goes somewhere unexpected.
+      const last = this.sql.exec("SELECT last_target FROM dm_channels WHERE user_id = ?", m.author.id).toArray()[0];
+      if (sn(last?.last_target) !== route.to) {
+        this.sql.exec("UPDATE dm_channels SET last_target = ? WHERE user_id = ?", route.to, m.author.id);
+        await this.send(m.channelId, renderRelayRouted(this.nameOf(route.to), ref)).catch((e) => console.error("relay notice failed", e));
+      }
       return "forwarded";
     } catch (e) {
       if (e instanceof DiscordError && e.cannotDm) {
@@ -941,14 +954,31 @@ export class Bureau extends DurableObject<Env> {
     return forwarded;
   }
 
-  /** A reply goes to whoever the replied-to message came from; otherwise to the person they last dealt with. */
+  /**
+   * Who a typed message is for. A reply goes to whoever the replied-to message came from.
+   * Otherwise it goes to whoever the bot last brought them something from (the last notice sender),
+   * or the person they last summoned or messaged, whichever is more recent. Never back to the sender.
+   */
   private routeFor(userId: string, replyTo: string | null, now: number): { to: string; summonsId: string | null } | null {
     if (replyTo) {
       const r = this.sql.exec("SELECT peer_id, summons_id FROM bot_messages WHERE message_id = ? AND user_id = ?", replyTo, userId).toArray()[0];
-      if (r?.peer_id) return { to: s(r.peer_id), summonsId: sn(r.summons_id) };
+      if (r?.peer_id && s(r.peer_id) !== userId) return { to: s(r.peer_id), summonsId: sn(r.summons_id) };
     }
-    const p = this.sql.exec("SELECT partner_id, summons_id FROM relay_partners WHERE user_id = ? AND at > ?", userId, now - PARTNER_TTL_MS).toArray()[0];
-    return p ? { to: s(p.partner_id), summonsId: sn(p.summons_id) } : null;
+    const since = now - PARTNER_TTL_MS;
+    const candidates = [
+      ...this.sql
+        .exec(
+          `SELECT peer_id AS who, summons_id, at FROM bot_messages
+           WHERE user_id = ? AND peer_id IS NOT NULL AND peer_id != ? AND at > ? ORDER BY at DESC LIMIT 1`,
+          userId, userId, since,
+        )
+        .toArray(),
+      ...this.sql
+        .exec("SELECT partner_id AS who, summons_id, at FROM relay_partners WHERE user_id = ? AND partner_id != ? AND at > ?", userId, userId, since)
+        .toArray(),
+    ].sort((a, b) => n(b.at) - n(a.at));
+    const best = candidates[0];
+    return best ? { to: s(best.who), summonsId: sn(best.summons_id) } : null;
   }
 
   private nameOf(userId: string): string {
@@ -965,6 +995,7 @@ export class Bureau extends DurableObject<Env> {
   }
 
   private notePartner(userId: string, partnerId: string, summonsId: string | null, now: number) {
+    if (userId === partnerId) return; // summoning yourself is a test, not a conversation
     this.sql.exec(
       `INSERT INTO relay_partners (user_id, partner_id, summons_id, at) VALUES (?, ?, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET partner_id = excluded.partner_id, summons_id = excluded.summons_id, at = excluded.at`,

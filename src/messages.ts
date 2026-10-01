@@ -276,6 +276,32 @@ export function renderSummons(
   };
 }
 
+/**
+ * The summons as Discord-formatted text, to paste and send from your own account.
+ * Mentions and <t:…> timestamps render in normal messages too; there are no buttons, so people answer by reacting.
+ */
+export function renderSummonsText(s: Summons, recipientIds: string[], bureau: string): string {
+  const priority = PRIORITY_INFO[s.priority];
+  const lines = ["# 📨 OFFICIAL SUMMONS", `-# ${bureau.toUpperCase()} · FORM BMA-27`, `### ${priority.emoji} ${s.classification}`, `**${s.title}**`];
+  if (s.objective) lines.push(quote(clip(s.objective, 600)));
+  lines.push("");
+  const ids = recipientIds.filter((id) => /^\d{15,21}$/.test(id));
+  if (ids.length) lines.push(`**Personnel requested:** ${ids.map(mention).join(", ")}`);
+  lines.push(
+    `🗓️ **Commences:** ${ts(s.startsAt, "F")} (${ts(s.startsAt, "R")})`,
+    `⏱️ **Est. duration:** ${formatDuration(s.durationMin)}`,
+    `📍 **Location:** ${s.location || "To be disclosed"}`,
+    `🚨 **Priority:** ${priority.emoji} ${priority.label}`,
+  );
+  if (s.dressCode) lines.push(`👔 **Dress code:** ${s.dressCode}`);
+  if (s.respondBy) lines.push(`⌛ **Respond by:** ${ts(s.respondBy, "f")}`);
+  lines.push(`🖋️ **Issued by:** ${s.organizer.name}${s.signatureTitle ? `, *${s.signatureTitle}*` : ""}`);
+  lines.push("", `**React to respond:** ${s.options.map((o) => (o.emoji ? `${o.emoji} ${o.label}` : o.label)).join(" · ")}`);
+  lines.push("-# Failure to respond may result in public disappointment.");
+  // Discord's 2000-character limit for normal messages, with room for emoji that count double.
+  return clip(lines.join("\n"), 1950);
+}
+
 export function responseRow(s: Pick<Summons, "id" | "options">, disabled = false): ActionRow {
   return {
     type: 1,
@@ -587,6 +613,15 @@ export function renderRelayHelp(): MessagePayload {
     content:
       "🏛️ **The Bureau isn't sure who this is for.**\n" +
       "Reply to a summons or a forwarded message (long-press it → **Reply**) and the Bureau will pass your message on.",
+    allowed_mentions: { parse: [] },
+  };
+}
+
+export function renderRelayRouted(to: string, ref: string | null): MessagePayload {
+  return {
+    content:
+      `↪️ The Bureau is passing your messages to **${clip(to, 60)}**${ref ? ` (re: ${ref})` : ""}.\n` +
+      "-# To reach someone else, reply to one of their messages (long-press it → Reply).",
     allowed_mentions: { parse: [] },
   };
 }

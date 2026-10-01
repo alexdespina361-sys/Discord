@@ -1,5 +1,5 @@
 import { renderMessage } from "./discord-preview.js";
-import { el, getJson, postJson, readData, toast } from "./lib.js";
+import { copyText, el, getJson, postJson, readData, toast } from "./lib.js";
 
 const data = readData("compose-data");
 const form = document.getElementById("compose");
@@ -321,8 +321,11 @@ function collect() {
 
 let previewTimer;
 let previewSeq = 0;
+let previewFresh = false;
+let copyTextValue = "";
 
 function schedulePreview() {
+  previewFresh = false;
   clearTimeout(previewTimer);
   previewTimer = setTimeout(updatePreview, 200);
 }
@@ -330,8 +333,10 @@ function schedulePreview() {
 async function updatePreview() {
   const seq = ++previewSeq;
   try {
-    const { message } = await postJson("/api/preview", collect());
+    const { message, text } = await postJson("/api/preview", collect());
     if (seq !== previewSeq) return;
+    copyTextValue = text;
+    previewFresh = true;
     const names = { [data.me.id]: data.me.name, 0: "Recipient" };
     for (const m of state.picked.values()) names[m.id] = m.name;
     $("preview").replaceChildren(renderMessage(message, { names }));
@@ -410,6 +415,32 @@ form.addEventListener("submit", async (e) => {
 });
 
 for (const id of ["title", "startsAt", "classification"]) $(id).addEventListener("input", () => clearError(id));
+
+// --- copy instead of dispatching ----------------------------------------------------------------
+
+$("copy-text").addEventListener("click", async () => {
+  clearErrors();
+  if (!$("title").value.trim()) return showError("title", "Give the summons a title first.");
+  const who = [...state.picked.values()][0]?.name;
+  const done = (ok) => ok && toast(`📋 Copied. Paste it in your DM${who ? ` with ${who}` : ""} and send it.`);
+  if (previewFresh && copyTextValue) {
+    // Copy within the tap itself: some phone browsers refuse clipboard writes after a network request.
+    done(await copyText(copyTextValue));
+    return;
+  }
+  clearTimeout(previewTimer);
+  const fresh = updatePreview().then(() => copyTextValue);
+  if (window.ClipboardItem && navigator.clipboard?.write) {
+    try {
+      await navigator.clipboard.write([new ClipboardItem({ "text/plain": fresh.then((t) => new Blob([t], { type: "text/plain" })) })]);
+      done(true);
+      return;
+    } catch {
+      // fall through to the manual copy box
+    }
+  }
+  done(await copyText(await fresh));
+});
 
 // --- initial state ------------------------------------------------------------------------------
 

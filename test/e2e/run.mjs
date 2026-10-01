@@ -246,11 +246,14 @@ await step("directory lists humans (no bots) and text channels", async () => {
   assert.deepEqual(dir.channels.map((c) => c.name), ["general"]);
 });
 
-await step("live preview renders a valid Discord message", async () => {
+await step("live preview renders a valid Discord message, plus a copyable text version", async () => {
   const r = await api("/api/preview", { title: "Preview", recipients: [IDS.alice] });
   assert.equal(r.status, 200);
   assertValidMessage(r.json.message, "preview");
   assert.match(text(r.json.message), /OFFICIAL SUMMONS/);
+  assert.match(r.json.text, /^# 📨 OFFICIAL SUMMONS/);
+  assert.match(r.json.text, new RegExp(`<@${IDS.alice}>`));
+  assert.match(r.json.text, /React to respond/);
 });
 
 const baseDraft = {
@@ -389,6 +392,7 @@ await step("Andrei changes his mind and files a weak excuse (modal pre-filled ne
 
 await step("the dossier page shows the roster and case file", async () => {
   const html = await (await web(`/s/${summonsId}`)).text();
+  assert.match(html, /data-copy="# 📨 OFFICIAL SUMMONS/);
   assert.match(html, /my cat scheduled a meeting with me/);
   assert.match(html, /Extension granted/);
   assert.match(html, /Case file/);
@@ -603,6 +607,33 @@ await step("messages typed while disconnected are caught up after a new session"
   await typeDm(IDS.alice, "sent while you were away", { quiet: true });
   await waitFor("new session", () => fake.state.gateway.identifies > identifies);
   await waitFor("caught-up forward", () => dmsTo(IDS.organizer).find((m) => m.content?.includes("sent while you were away")));
+});
+
+await step("summoning yourself never echoes your own messages back to you", async () => {
+  const self = await api("/api/summons", {
+    ...baseDraft,
+    title: "Self test",
+    recipients: [IDS.organizer],
+    startsAt: Date.now() + 3_600_000,
+    createScheduledEvent: false,
+  });
+  assert.equal(self.status, 200);
+  const selfDm = dmsTo(IDS.organizer).find((m) => m.components?.[0]?.components?.[0]?.custom_id === `r:${self.json.id}:yes`);
+  await typeDm(IDS.organizer, "testing the relay", { replyTo: selfDm.id });
+  // Goes to the last person who sent Mihai something (Andrei), never back to Mihai.
+  await waitFor("forward to Andrei", () => dmsTo(IDS.alice).find((m) => m.content?.includes("testing the relay")));
+  await sleep(500);
+  assert.equal(dmsTo(IDS.organizer).filter((m) => m.content?.includes("testing the relay")).length, 0);
+});
+
+await step("people are told who their messages go to whenever that changes", async () => {
+  const notices = dmsTo(IDS.alice).filter((m) => m.content?.startsWith("↪️"));
+  assert.ok(notices.length >= 1);
+  assert.match(notices[0].content, /passing your messages to \*\*Mihai\*\*/);
+  const before = notices.length;
+  await typeDm(IDS.alice, "same person again");
+  await waitFor("forward", () => dmsTo(IDS.organizer).find((m) => m.content?.includes("same person again")));
+  assert.equal(dmsTo(IDS.alice).filter((m) => m.content?.startsWith("↪️")).length, before, "no repeat notice");
 });
 
 await step("forwarding can be switched off and back on from the setup page", async () => {

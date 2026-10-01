@@ -14,7 +14,7 @@ import {
   type SummonsBundle,
   type SummonsDossier,
 } from "../model";
-import { renderSummons, statusEmoji } from "../messages";
+import { renderSummons, renderSummonsText, statusEmoji } from "../messages";
 import { ALL_TEMPLATES } from "../templates";
 import type { Session } from "../session";
 import type { SetupReport } from "../setup";
@@ -364,6 +364,9 @@ export function composePage(
     <div class="dispatch">
       <p class="form-error" id="form-error" role="alert" hidden></p>
       <button type="submit" form="compose" class="btn btn--primary btn--lg btn--block" id="dispatch">📨 Dispatch summons</button>
+      <div class="or"><span>or</span></div>
+      <button type="button" class="btn btn--secondary btn--lg btn--block" id="copy-text">📋 Copy to send it yourself</button>
+      <p class="hint">Copies the summons as text. Paste it in your DM and send it yourself: the bot sends nothing. There are no buttons on your own message, so they answer by reacting with an emoji.</p>
     </div>
   </div>`;
   return page({ ...c, title: "New summons", active: "new", body, scripts: ["/static/compose.js"] });
@@ -476,6 +479,7 @@ export function dossierPage(c: Ctx & { session: Session }, d: SummonsDossier): R
         ? html`<section class="actions">
             ${active ? html`<button type="button" class="btn btn--secondary" data-action="/api/summons/${s.id}/nudge">🔔 Send a reminder now</button>` : null}
             <a class="btn btn--secondary" href="/new?from=${s.id}">📄 Duplicate</a>
+            <button type="button" class="btn btn--secondary" data-copy="${renderSummonsText(s, invites.map((i) => i.recipient.id), bureauName(c.env))}">📋 Copy as text</button>
             ${active ? html`<button type="button" class="btn btn--danger" data-action="/api/summons/${s.id}/cancel" data-confirm="Cancel this summons? Everyone will be released from duty.">🗂️ Cancel summons</button>` : null}
           </section>`
         : null

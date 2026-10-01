@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { validateMessage, validateModal } from "../e2e/fake-discord.mjs";
 import {
+  renderSummonsText,
   renderBriefing,
   renderCancelNotice,
   renderModal,
@@ -158,6 +159,27 @@ describe("modals", () => {
     expect(findInputValue([{ type: 10 }, { type: 18, component: { type: 4, custom_id: "note", value: "cat" } }], "note")).toBe("cat");
     expect(findInputValue([{ type: 1, components: [{ type: 4, custom_id: "note", value: "dog" }] }], "note")).toBe("dog");
     expect(findInputValue([{ type: 18, component: { type: 4, custom_id: "other", value: "x" } }], "note")).toBeNull();
+  });
+});
+
+describe("renderSummonsText", () => {
+  it("formats the summons for pasting into a normal Discord message", () => {
+    const text = renderSummonsText(summons(), ["140000000000000111"], "Bureau of Mandatory Attendance");
+    expect(text.startsWith("# 📨 OFFICIAL SUMMONS\n-# BUREAU OF MANDATORY ATTENDANCE · FORM BMA-27")).toBe(true);
+    expect(text).toContain("### 🟠 MANDATORY LOGISTICS OPERATION");
+    expect(text).toContain("**Personnel requested:** <@140000000000000111>");
+    expect(text).toMatch(/<t:\d+:F> \(<t:\d+:R>\)/);
+    expect(text).toContain("**React to respond:** 🫡 Accept Mission · ❌ Decline Assignment · 🤡 Provide Weak Excuse · ⏳ Request Extension");
+    expect(text).toContain("🖋️ **Issued by:** Mihai, *Chief Logistics Officer*");
+  });
+
+  it("stays under Discord's message limit at maximum sizes, and skips missing recipients", () => {
+    const long = (n: number) => "W".repeat(n);
+    const s = summons({ title: long(100), objective: long(1000), location: long(100), dressCode: long(80), signatureTitle: long(60), respondBy: NOW });
+    const ids = Array.from({ length: 10 }, (_, i) => `1400000000000001${String(i).padStart(2, "0")}`);
+    const text = renderSummonsText(s, ids, long(60));
+    expect(text.length).toBeLessThanOrEqual(2000);
+    expect(renderSummonsText(summons(), ["0"], "B")).not.toContain("Personnel requested");
   });
 });
 

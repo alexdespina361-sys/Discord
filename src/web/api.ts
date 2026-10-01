@@ -22,7 +22,7 @@ import {
   type ResponseOption,
   type Summons,
 } from "../model";
-import { clip, renderSummons } from "../messages";
+import { clip, renderSummons, renderSummonsText } from "../messages";
 import type { Session } from "../session";
 import { bureauStub } from "../stub";
 
@@ -161,7 +161,10 @@ export function preview(env: Env, session: Session, input: Record<string, unknow
     error: null,
   }));
   const addressees = summons.delivery === "channel" ? invites : invites.slice(0, 1);
-  return Response.json({ message: renderSummons(summons, invites, addressees, bureauName(env), now) });
+  return Response.json({
+    message: renderSummons(summons, invites, addressees, bureauName(env), now),
+    text: renderSummonsText(summons, recipients, bureauName(env)),
+  });
 }
 
 export async function createSummons(

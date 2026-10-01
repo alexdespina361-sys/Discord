@@ -1,4 +1,4 @@
-import { formatTime, postJson, toast } from "./lib.js";
+import { copyText, formatTime, postJson, toast } from "./lib.js";
 
 // Avatars come from Discord's CDN; if one fails, show the Bureau seal instead of a broken image.
 function avatarFallback(img) {
@@ -23,13 +23,7 @@ setInterval(localizeTimes, 30_000);
 document.addEventListener("click", async (event) => {
   const copy = event.target.closest("[data-copy]");
   if (copy) {
-    try {
-      await navigator.clipboard.writeText(copy.dataset.copy);
-      toast("Copied to clipboard");
-    } catch {
-      copy.previousElementSibling?.select?.();
-      toast("Press and hold to copy");
-    }
+    if (await copyText(copy.dataset.copy)) toast("📋 Copied to clipboard");
     return;
   }
 

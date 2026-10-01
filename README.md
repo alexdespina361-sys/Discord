@@ -12,8 +12,9 @@ Write “come play LoL” or “come to Lidl with me” on a website, and it bec
 - Summon several people at once (each gets a DM with a live roster), or post one public summons in a channel that pings everyone.
 - Optionally adds the summons to the server's **Events** tab too.
 - **`/summon` in your own DM with a friend.** Type `/summon who:@friend what:Gaming` and the summons appears right in that chat. If they don't answer, up to 3 notices follow automatically in the first 15 minutes, and a 🔔 button (issuer only) starts another round.
-- **Replies are forwarded.** Whatever your friend types to the bot is passed on to whoever summoned them. Reply to a forwarded message and your answer goes back.
+- **Replies are forwarded.** Whatever your friend types to the bot is passed on to whoever last sent them something through the Bureau (usually whoever summoned them). Reply to a forwarded message and your answer goes back. Messages are never forwarded back to the person who wrote them, and the bot says who your messages go to whenever that changes.
 - **Blocks are respected.** If someone blocks the bot (or closes their DMs), notices to them stop and you get one message saying so.
+- **Or send it yourself.** Next to *Dispatch summons* there's *Copy to send it yourself*: it copies the summons as formatted Discord text (mentions and times included) to paste into your DM and send from your own account. The bot sends nothing; your friend answers by reacting with an emoji.
 
 It runs for free on Cloudflare Workers. There's no server to keep running.
 

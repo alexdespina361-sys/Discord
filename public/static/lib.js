@@ -57,6 +57,35 @@ export function el(tag, attrs = {}, ...children) {
   return node;
 }
 
+/** Copies to the clipboard, or shows the text in a box to copy by hand when the browser won't allow it. */
+export async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    showCopyDialog(text);
+    return false;
+  }
+}
+
+export function showCopyDialog(text) {
+  const area = el("textarea", { readonly: true, rows: 12, "aria-label": "Text to copy" }, text);
+  const overlay = el(
+    "div",
+    { class: "copy-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Copy the text" },
+    el(
+      "div",
+      { class: "card copy-dialog__card" },
+      el("h2", {}, "Copy this, then paste it in Discord"),
+      area,
+      el("div", { class: "copy-dialog__actions" }, el("button", { type: "button", class: "btn btn--primary", onclick: () => overlay.remove() }, "Done")),
+    ),
+  );
+  document.body.append(overlay);
+  area.focus();
+  area.select();
+}
+
 export function readData(id) {
   const node = document.getElementById(id);
   return node ? JSON.parse(node.textContent) : null;
